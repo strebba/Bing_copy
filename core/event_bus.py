@@ -20,6 +20,11 @@ class EventType(str, Enum):
     POSITION_OPENED = "position_opened"
     POSITION_CLOSED = "position_closed"
     CIRCUIT_BREAKER = "circuit_breaker"
+    # H-4: published whenever the circuit breaker moves to a new level
+    # (escalation AND recovery).  Payload keys:
+    #   previous_level, new_level, current_dd, size_multiplier,
+    #   cooldown_hours, timestamp
+    CIRCUIT_BREAKER_LEVEL_CHANGE = "circuit_breaker.level_change"
     EMERGENCY_STOP = "emergency_stop"
     HEARTBEAT = "heartbeat"
     FUNDING_RATE_UPDATE = "funding_rate_update"

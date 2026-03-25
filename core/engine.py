@@ -53,20 +53,21 @@ class TradingEngine:
         self._orderbook = OrderBookProcessor()
         self._funding = FundingRateTracker(self._client)
 
-        # Risk
-        self._dd_monitor = DrawdownMonitor(settings.INITIAL_CAPITAL)
-        self._sizer = PositionSizer()
-        self._corr_guard = CorrelationGuard()
-        self._emergency = EmergencyStop()
-
-        # Strategy
-        self._portfolio = PortfolioManager(self._dd_monitor)
-
-        # State
+        # State / event bus — initialised before risk/strategy so they can
+        # subscribe during construction (H-4).
         self._state = StateManager()
         self._event_bus = EventBus()
         self._equity = settings.INITIAL_CAPITAL
         self._running = False
+
+        # Risk — pass event_bus so DrawdownMonitor publishes level-change events
+        self._dd_monitor = DrawdownMonitor(settings.INITIAL_CAPITAL, event_bus=self._event_bus)
+        self._sizer = PositionSizer()
+        self._corr_guard = CorrelationGuard()
+        self._emergency = EmergencyStop()
+
+        # Strategy — pass event_bus so PortfolioManager reacts to level changes
+        self._portfolio = PortfolioManager(self._dd_monitor, event_bus=self._event_bus)
 
         # Wire RiskEngine with exchange client and state manager so it can
         # reconcile live positions before every pre-trade check (C-1).
@@ -77,8 +78,8 @@ class TradingEngine:
             state_manager=self._state,
         )
 
-        # Alerting
-        self._alerter = TelegramAlerter()
+        # Alerting — pass event_bus so Telegram fires on level changes (H-4)
+        self._alerter = TelegramAlerter(event_bus=self._event_bus)
 
         # Performance tracking (simple rolling stats)
         self._win_count = 0
@@ -111,6 +112,7 @@ class TradingEngine:
 
         # Subscribe event handlers
         self._event_bus.subscribe(EventType.CIRCUIT_BREAKER, self._on_circuit_breaker)
+        self._event_bus.subscribe(EventType.CIRCUIT_BREAKER_LEVEL_CHANGE, self._on_circuit_breaker_level_change)
         self._event_bus.subscribe(EventType.EMERGENCY_STOP, self._on_emergency_stop)
 
         # Run all subsystems with crash supervision
@@ -174,10 +176,10 @@ class TradingEngine:
                     if pending:
                         await asyncio.wait(pending, timeout=10)
 
-                    # Trigger emergency stop for critical subsystems
+                    # Trigger emergency stop for critical subsystems (H-1: deduplication)
                     if task.get_name() in critical_tasks:
                         reason = f"Critical task '{task.get_name()}' crashed: {exc}"
-                        self._emergency.activate(reason)
+                        await self._emergency.trigger(reason)
                         await self._event_bus.publish(
                             Event(
                                 EventType.EMERGENCY_STOP,
@@ -484,7 +486,7 @@ class TradingEngine:
                 level = self._dd_monitor.update(equity)
 
                 if self._dd_monitor.requires_emergency_close():
-                    self._emergency.activate("Max drawdown exceeded")
+                    await self._emergency.trigger("Max drawdown exceeded")
                     await self._event_bus.publish(
                         Event(EventType.EMERGENCY_STOP, {"reason": "max_dd"})
                     )
@@ -555,6 +557,15 @@ class TradingEngine:
     async def _on_circuit_breaker(self, event: Event) -> None:
         level = event.data.get("level")
         logger.warning("Circuit breaker event: %s", level)
+
+    async def _on_circuit_breaker_level_change(self, event: Event) -> None:
+        """Log circuit breaker level transitions (H-4). Subscribers handle the rest."""
+        prev = event.data.get("previous_level", "NONE")
+        new = event.data.get("new_level", "NONE")
+        mult = event.data.get("size_multiplier", 1.0)
+        logger.warning(
+            "Circuit breaker transition: %s → %s | size_multiplier=%.2f", prev, new, mult
+        )
 
     async def _on_emergency_stop(self, event: Event) -> None:
         logger.critical("EMERGENCY STOP: %s", event.data.get("reason"))

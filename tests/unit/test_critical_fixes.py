@@ -249,6 +249,8 @@ class TestSupervisedGather:
         engine._emergency.is_active = False
         engine._emergency.reason = ""
         engine._emergency.activate = MagicMock()
+        # H-1: engine now calls await trigger() for concurrent-safe stop
+        engine._emergency.trigger = AsyncMock(return_value=0)
         engine._event_bus = MagicMock()
         engine._event_bus.publish = AsyncMock()
         engine._alerter = MagicMock()
@@ -283,8 +285,9 @@ class TestSupervisedGather:
                 names=["market_data", "some_other"],
             )
 
-        engine._emergency.activate.assert_called_once()
-        call_arg = engine._emergency.activate.call_args[0][0]
+        # H-1: engine now calls await trigger() instead of activate()
+        engine._emergency.trigger.assert_awaited_once()
+        call_arg = engine._emergency.trigger.call_args[0][0]
         assert "market_data" in call_arg
 
     @pytest.mark.asyncio

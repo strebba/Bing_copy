@@ -1,12 +1,18 @@
 """
 Telegram alerting — sends trade, risk, and system notifications.
+
+H-4 Fix: subscribes to CIRCUIT_BREAKER_LEVEL_CHANGE events and sends a
+detailed Telegram notification whenever the breaker changes level.
 """
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import aiohttp
 
 from config import settings
+
+if TYPE_CHECKING:
+    from core.event_bus import Event, EventBus
 
 logger = logging.getLogger(__name__)
 
@@ -20,11 +26,20 @@ class TelegramAlerter:
         self,
         token: str = settings.TELEGRAM_BOT_TOKEN,
         chat_id: str = settings.TELEGRAM_CHAT_ID,
+        event_bus: Optional["EventBus"] = None,
     ) -> None:
         self._token = token
         self._chat_id = chat_id
         self._enabled = bool(token and chat_id)
         self._session: Optional[aiohttp.ClientSession] = None
+
+        # H-4: subscribe to circuit breaker level changes
+        if event_bus is not None:
+            from core.event_bus import EventType  # noqa: PLC0415
+            event_bus.subscribe(
+                EventType.CIRCUIT_BREAKER_LEVEL_CHANGE,
+                self._on_circuit_breaker_level_change,
+            )
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
@@ -55,6 +70,32 @@ class TelegramAlerter:
         except Exception as exc:
             logger.error("Telegram send failed: %s", exc)
             return False
+
+    async def _on_circuit_breaker_level_change(self, event: "Event") -> None:
+        """Send a Telegram alert whenever the circuit breaker changes level (H-4)."""
+        data = event.data
+        prev = data.get("previous_level", "NONE")
+        new = data.get("new_level", "NONE")
+        dd_pct = data.get("current_dd", 0.0) * 100
+        multiplier = data.get("size_multiplier", 1.0)
+        cooldown_h = data.get("cooldown_hours", 0)
+
+        if new == "NONE":
+            emoji = "✅"
+            action_line = "Trading ripreso normalmente (size 1.0x)"
+        else:
+            emoji = "⚠️"
+            action = f"Size ridotto a `{multiplier:.2f}x`"
+            if cooldown_h > 0:
+                action += f" + cooldown `{cooldown_h}h`"
+            action_line = action
+
+        msg = (
+            f"{emoji} *Circuit Breaker — {prev} → {new}*\n"
+            f"Drawdown corrente: `{dd_pct:.2f}%`\n"
+            f"Azione: {action_line}"
+        )
+        await self.send(msg)
 
     async def alert_position_opened(
         self, symbol: str, direction: str, entry: float, sl: float, tp: float, strategy: str
