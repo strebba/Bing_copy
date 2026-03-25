@@ -69,11 +69,13 @@ class TradingEngine:
         # Strategy — pass event_bus so PortfolioManager reacts to level changes
         self._portfolio = PortfolioManager(self._dd_monitor, event_bus=self._event_bus)
 
-        # Wire RiskEngine with exchange client and state manager so it can
-        # reconcile live positions before every pre-trade check (C-1).
+        # Wire RiskEngine with exchange client, state manager, and correlation
+        # guard so it can reconcile live positions before every pre-trade check
+        # (C-1) and enforce correlation limits (H-3).
         self._risk_engine = RiskEngine(
             self._dd_monitor,
             self._sizer,
+            correlation_guard=self._corr_guard,
             exchange_client=self._client,
             state_manager=self._state,
         )
@@ -115,6 +117,13 @@ class TradingEngine:
         self._event_bus.subscribe(EventType.CIRCUIT_BREAKER_LEVEL_CHANGE, self._on_circuit_breaker_level_change)
         self._event_bus.subscribe(EventType.EMERGENCY_STOP, self._on_emergency_stop)
 
+        # Wire Telegram alerter to event bus (H-2)
+        self._alerter.subscribe_to_event_bus(
+            self._event_bus,
+            state_manager=self._state,
+            dd_monitor=self._dd_monitor,
+        )
+
         # Run all subsystems with crash supervision
         try:
             await self._supervised_gather(
@@ -125,6 +134,8 @@ class TradingEngine:
                 self._equity_loop(),
                 self._reconcile_loop(),
                 self._heartbeat_loop(),
+                self._alerter.digest_loop(),
+                self._alerter.bot_polling_loop(),
                 names=[
                     "market_data",
                     "funding_tracker",
@@ -133,6 +144,8 @@ class TradingEngine:
                     "equity_loop",
                     "reconcile_loop",
                     "heartbeat_loop",
+                    "alerter_digest",
+                    "alerter_polling",
                 ],
             )
         finally:
@@ -292,17 +305,6 @@ class TradingEngine:
         """Pre-trade checks → size calculation → order submission."""
         symbol = signal.symbol
 
-        # Correlation guard
-        open_syms = self._state.open_symbols()
-        correlated, max_corr = self._corr_guard.is_correlated_with_open(
-            symbol, open_syms
-        )
-        if correlated:
-            logger.debug(
-                "Signal rejected (correlation=%.2f): %s", max_corr, symbol
-            )
-            return
-
         # Spread check
         spread = self._orderbook.spread_pct(symbol)
 
@@ -313,13 +315,15 @@ class TradingEngine:
         except Exception:
             volume_24h = 0.0
 
-        # Pre-trade risk approval (async — reconciles positions before check)
-        approved, reason = await self._risk_engine.approve_signal(
+        # Pre-trade risk approval (async — reconciles positions before check,
+        # includes correlation guard via H-3)
+        approved, reason = await self._risk_engine.pre_trade_check(
             signal=signal,
             equity=self._equity,
             volume_24h=volume_24h,
             current_spread_pct=spread,
             existing_positions_risk_usdt=self._state.total_open_risk_usdt(),
+            open_positions=self._state.all_positions(),
         )
         if not approved:
             logger.debug("Signal rejected (%s): %s", reason, symbol)
@@ -477,6 +481,7 @@ class TradingEngine:
     # ── Background loops ──────────────────────────────────────────────────────
 
     async def _equity_loop(self) -> None:
+        _prev_cb_level = None
         while self._running:
             try:
                 data = await self._client.get_balance()
@@ -484,6 +489,17 @@ class TradingEngine:
                 equity = float(balance.get("equity", self._equity))
                 self._equity = equity
                 level = self._dd_monitor.update(equity)
+
+                # Publish circuit breaker event on level change
+                if level != _prev_cb_level:
+                    _prev_cb_level = level
+                    await self._event_bus.publish(Event(
+                        EventType.CIRCUIT_BREAKER,
+                        {
+                            "level": level,
+                            "dd_pct": abs(self._dd_monitor.current_drawdown() * 100),
+                        },
+                    ))
 
                 if self._dd_monitor.requires_emergency_close():
                     await self._emergency.trigger("Max drawdown exceeded")

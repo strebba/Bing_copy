@@ -3,9 +3,10 @@ Core risk engine — pre-trade checks, in-trade management, portfolio controls.
 """
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import settings
+from risk.correlation_guard import CorrelationGuard
 from risk.drawdown_monitor import DrawdownMonitor
 from risk.position_sizer import PositionSizer
 from strategy.base_strategy import Signal, SignalDirection
@@ -33,12 +34,14 @@ class RiskEngine:
         open_positions: Optional[Dict] = None,
         exchange_client: Optional[Any] = None,
         state_manager: Optional[Any] = None,
+        correlation_guard: Optional[CorrelationGuard] = None,
     ) -> None:
         self._dd = dd_monitor
         self._sizer = position_sizer
         self._open_positions: Dict = open_positions or {}
         self._client = exchange_client
         self._state = state_manager
+        self._corr_guard: CorrelationGuard = correlation_guard or CorrelationGuard()
         # Monotonic timestamp of the last successful reconciliation with exchange
         self._last_reconcile: float = 0.0
 
@@ -93,6 +96,50 @@ class RiskEngine:
                 "RiskEngine: position reconciliation failed — using cached data: %s",
                 exc,
             )
+
+    # ── Level 1 — Full async pre-trade pipeline (with correlation) ────────────
+
+    async def pre_trade_check(
+        self,
+        signal: Signal,
+        equity: float,
+        volume_24h: float,
+        current_spread_pct: float,
+        existing_positions_risk_usdt: float,
+        open_positions: Optional[list] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Full async pre-trade check pipeline:
+          1. Position count
+          2. Daily / weekly loss limits
+          3. Liquidity & spread checks
+          4. Open risk cap
+          5. Correlation guard  <- H-3
+
+        Returns (approved, reason).
+        """
+        # Checks 1-4 via async approve_signal (includes reconciliation)
+        approved, reason = await self.approve_signal(
+            signal=signal,
+            equity=equity,
+            volume_24h=volume_24h,
+            current_spread_pct=current_spread_pct,
+            existing_positions_risk_usdt=existing_positions_risk_usdt,
+        )
+        if not approved:
+            return False, reason
+
+        # Check 5 — Correlation guard
+        if open_positions:
+            is_ok, corr_reason = await self._corr_guard.check(
+                new_pair=signal.symbol,
+                new_direction=signal.direction.value,
+                open_positions=open_positions,
+            )
+            if not is_ok:
+                return False, f"Correlation guard rejected: {corr_reason}"
+
+        return True, "OK"
 
     # ── Level 1 — Pre-trade ───────────────────────────────────────────────────
 
