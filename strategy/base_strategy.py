@@ -29,6 +29,7 @@ class Signal:
     risk_pct: float                    # Fraction of equity to risk
     confidence: float                  # 0–1 confluence score
     timeframe: str = "1H"
+    trailing_activation_rr: float = 1.0  # R:R at which trailing stop activates (1.0 = 1:1)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property

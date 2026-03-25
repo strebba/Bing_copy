@@ -147,6 +147,29 @@ class RiskEngine:
         if existing_positions_risk_usdt >= max_open_risk:
             return False, f"Max open risk exceeded ({existing_positions_risk_usdt:.0f} USDT)"
 
+        # TP must exist and be on the correct side of entry
+        if signal.take_profit <= 0:
+            return False, "TP price missing (take_profit must be > 0)"
+
+        if signal.direction == SignalDirection.LONG:
+            if signal.take_profit <= signal.entry_price:
+                return (
+                    False,
+                    f"TP must be above entry for LONG "
+                    f"(tp={signal.take_profit}, entry={signal.entry_price})",
+                )
+        else:
+            if signal.take_profit >= signal.entry_price:
+                return (
+                    False,
+                    f"TP must be below entry for SHORT "
+                    f"(tp={signal.take_profit}, entry={signal.entry_price})",
+                )
+
+        # Minimum R:R ratio
+        if signal.risk_reward < 1.5:
+            return False, f"R:R ratio too low ({signal.risk_reward:.2f} < 1.5)"
+
         return True, "OK"
 
     def calculate_order_size(

@@ -203,17 +203,23 @@ class Backtester:
     ) -> tuple[bool, float, str]:
         """Check if a trade should be exited. Returns (closed, exit_price, reason)."""
         if trade.direction == "LONG":
-            # Stop loss hit
+            # Stop loss hit — SL is a market order that may fill slightly below the stop
             if bar_low <= trade.stop_loss:
-                return True, trade.stop_loss, "stop_loss"
-            # Take profit hit
+                sl_fill = trade.stop_loss * (1 - self._cfg.slippage)
+                return True, sl_fill, "stop_loss"
+            # Take profit hit — TP_MARKET order fills slightly below the TP trigger
             if bar_high >= trade.take_profit:
-                return True, trade.take_profit, "take_profit"
+                tp_fill = trade.take_profit * (1 - self._cfg.slippage)
+                return True, tp_fill, "take_profit"
         else:  # SHORT
+            # SL: market buy fills slightly above stop
             if bar_high >= trade.stop_loss:
-                return True, trade.stop_loss, "stop_loss"
+                sl_fill = trade.stop_loss * (1 + self._cfg.slippage)
+                return True, sl_fill, "stop_loss"
+            # TP: market buy fills slightly above TP trigger
             if bar_low <= trade.take_profit:
-                return True, trade.take_profit, "take_profit"
+                tp_fill = trade.take_profit * (1 + self._cfg.slippage)
+                return True, tp_fill, "take_profit"
 
         # Time stop
         bars_held = bar_idx - trade.opened_bar
