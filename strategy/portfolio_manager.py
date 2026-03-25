@@ -7,13 +7,14 @@ This replaces the previous polling approach (reading dd_monitor.current_drawdown
 on every cycle) with an event-driven one so strategies react immediately.
 """
 import logging
+from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import pandas as pd
 
 from config.settings import STRATEGY_WEIGHTS
 from strategy.alpha_momentum import AlphaMomentumStrategy
-from strategy.base_strategy import Signal
+from strategy.base_strategy import Signal, SignalDirection
 from strategy.beta_mean_rev import BetaMeanReversionStrategy
 from strategy.gamma_breakout import GammaBreakoutStrategy
 from strategy.indicators import hurst_exponent, atr
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
     from core.event_bus import Event, EventBus
 
 logger = logging.getLogger(__name__)
+
+CONFLICT_CONFIDENCE_THRESHOLD = 0.05  # 5% difference to resolve conflict
 
 
 class MarketRegime:
@@ -174,4 +177,77 @@ class PortfolioManager:
                 all_signals.append(sig)
                 logger.info("[Gamma] %s %s (conf=%.2f)", symbol, sig.direction, sig.confidence)
 
-        return all_signals
+        return self._resolve_conflicts(all_signals)
+
+    @staticmethod
+    def _resolve_conflicts(signals: List[Signal]) -> List[Signal]:
+        """
+        Resolve conflicting signals on the same symbol.
+
+        Rules:
+        - If signals disagree on direction for the same symbol:
+          a) Take the one with highest confidence if diff >= 5%
+          b) Drop both if confidence difference < 5% (uncertainty)
+        - If multiple signals agree on direction for the same symbol:
+          keep only the one with highest confidence (avoid double sizing)
+        """
+        # Group signals by symbol
+        by_symbol: Dict[str, List[Signal]] = defaultdict(list)
+        for sig in signals:
+            by_symbol[sig.symbol].append(sig)
+
+        resolved: List[Signal] = []
+        for symbol, sym_signals in by_symbol.items():
+            if len(sym_signals) == 1:
+                resolved.append(sym_signals[0])
+                continue
+
+            # Separate by direction
+            longs = [s for s in sym_signals if s.direction == SignalDirection.LONG]
+            shorts = [s for s in sym_signals if s.direction == SignalDirection.SHORT]
+
+            if longs and shorts:
+                # Conflict: opposing directions
+                best_long = max(longs, key=lambda s: s.confidence)
+                best_short = max(shorts, key=lambda s: s.confidence)
+                diff = abs(best_long.confidence - best_short.confidence)
+
+                if diff < CONFLICT_CONFIDENCE_THRESHOLD:
+                    logger.warning(
+                        "[Conflict] %s: LONG (conf=%.2f, %s) vs SHORT (conf=%.2f, %s) "
+                        "— diff %.2f%% < 5%%, NO TRADE",
+                        symbol,
+                        best_long.confidence, best_long.strategy_name,
+                        best_short.confidence, best_short.strategy_name,
+                        diff * 100,
+                    )
+                else:
+                    winner = best_long if best_long.confidence > best_short.confidence else best_short
+                    loser = best_short if winner is best_long else best_long
+                    logger.warning(
+                        "[Conflict] %s: %s wins (conf=%.2f, %s) over %s (conf=%.2f, %s)",
+                        symbol,
+                        winner.direction.value, winner.confidence, winner.strategy_name,
+                        loser.direction.value, loser.confidence, loser.strategy_name,
+                    )
+                    resolved.append(winner)
+            elif longs:
+                # Multiple longs — pick best, no double sizing
+                best = max(longs, key=lambda s: s.confidence)
+                if len(longs) > 1:
+                    logger.info(
+                        "[Agree] %s: %d LONG signals, keeping best (conf=%.2f, %s)",
+                        symbol, len(longs), best.confidence, best.strategy_name,
+                    )
+                resolved.append(best)
+            elif shorts:
+                # Multiple shorts — pick best, no double sizing
+                best = max(shorts, key=lambda s: s.confidence)
+                if len(shorts) > 1:
+                    logger.info(
+                        "[Agree] %s: %d SHORT signals, keeping best (conf=%.2f, %s)",
+                        symbol, len(shorts), best.confidence, best.strategy_name,
+                    )
+                resolved.append(best)
+
+        return resolved

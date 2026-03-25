@@ -16,6 +16,13 @@ from strategy.base_strategy import BaseStrategy, Signal, SignalDirection
 
 logger = logging.getLogger(__name__)
 
+# Timeframe to expected bar duration in seconds
+_TF_SECONDS = {
+    "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+    "1H": 3600, "1h": 3600, "4H": 14400, "4h": 14400,
+    "1D": 86400, "1d": 86400,
+}
+
 COMMISSION_RATE = 0.0005    # 0.05 % taker fee (BingX)
 DEFAULT_SLIPPAGE = 0.0002   # 0.02 % slippage estimate
 
@@ -57,6 +64,45 @@ class Backtester:
         self._strategy = strategy
         self._cfg = config or BacktestConfig()
 
+    @staticmethod
+    def _normalize_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure all timestamps are in UTC seconds, sort chronologically, deduplicate."""
+        if "timestamp" not in df.columns:
+            return df
+
+        df = df.copy()
+
+        # Convert millisecond epoch to seconds if needed
+        ts = df["timestamp"]
+        if ts.dtype in ("int64", "float64") and (ts > 1e12).any():
+            df["timestamp"] = ts // 1000
+            logger.info("Converted millisecond epoch timestamps to seconds")
+
+        # Sort by timestamp (chronological order)
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        # Remove duplicate timestamps
+        n_before = len(df)
+        df = df.drop_duplicates(subset="timestamp", keep="last").reset_index(drop=True)
+        n_dupes = n_before - len(df)
+        if n_dupes > 0:
+            logger.warning("Removed %d duplicate timestamps", n_dupes)
+
+        # Detect gaps > 2x expected timeframe
+        timeframe = df.attrs.get("timeframe", "1H")
+        expected_sec = _TF_SECONDS.get(timeframe, 3600)
+        diffs = df["timestamp"].diff().dropna()
+        gap_mask = diffs > 2 * expected_sec
+        if gap_mask.any():
+            gap_count = int(gap_mask.sum())
+            max_gap = int(diffs.max())
+            logger.warning(
+                "Detected %d timestamp gaps > 2x timeframe (%ss). Max gap: %ds",
+                gap_count, expected_sec, max_gap,
+            )
+
+        return df
+
     def run(self, df: pd.DataFrame, symbol: str = "BTC-USDT") -> PerformanceTracker:
         """
         Run a full backtest on the provided OHLCV DataFrame.
@@ -65,6 +111,9 @@ class Backtester:
         tracker = PerformanceTracker(self._cfg.initial_capital)
         equity = self._cfg.initial_capital
         open_trades: List[OpenTrade] = []
+
+        # Normalize timestamps: convert ms→s, sort, dedup, gap warnings
+        df = self._normalize_timestamps(df)
 
         # Enrich with indicators
         df_enriched = enrich(df.copy())

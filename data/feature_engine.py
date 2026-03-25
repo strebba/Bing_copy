@@ -80,7 +80,8 @@ def enrich(df: pd.DataFrame, timeframe: str = "1H") -> pd.DataFrame:
     # ── Volume ─────────────────────────────────────────────────────────────────
     df["vol_sma_20"] = sma(volume, 20)
     df["vol_ratio"] = volume / df["vol_sma_20"]
-    df["vwap"] = vwap(high, low, close, volume)
+    ts_col = df["timestamp"] if "timestamp" in df.columns else None
+    df["vwap"] = vwap(high, low, close, volume, timestamps=ts_col)
 
     # ── Statistical ────────────────────────────────────────────────────────────
     df["zscore_20"] = zscore(close, 20)

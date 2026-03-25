@@ -105,12 +105,32 @@ def donchian_channel(
 # ── Volume / Price ────────────────────────────────────────────────────────────
 
 def vwap(
-    high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series
+    high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series,
+    timestamps: pd.Series | None = None,
 ) -> pd.Series:
+    """
+    Volume Weighted Average Price with daily reset.
+
+    If ``timestamps`` (epoch seconds or a DatetimeIndex-like series) are
+    provided, VWAP resets at UTC midnight each day.  Otherwise falls back to
+    a global cumulative VWAP (backward-compatible).
+    """
     typical_price = (high + low + close) / 3
-    cumulative_tp_vol = (typical_price * volume).cumsum()
-    cumulative_vol = volume.cumsum()
-    return cumulative_tp_vol / cumulative_vol
+    tp_vol = typical_price * volume
+
+    if timestamps is not None:
+        try:
+            dt_index = pd.to_datetime(timestamps, unit="s", utc=True)
+        except Exception:
+            dt_index = pd.to_datetime(timestamps, utc=True)
+        day_groups = dt_index.dt.date
+        cum_tp_vol = tp_vol.groupby(day_groups).cumsum()
+        cum_vol = volume.groupby(day_groups).cumsum()
+    else:
+        cum_tp_vol = tp_vol.cumsum()
+        cum_vol = volume.cumsum()
+
+    return cum_tp_vol / cum_vol.replace(0, np.nan)
 
 
 def zscore(series: pd.Series, period: int = 20) -> pd.Series:
@@ -121,14 +141,8 @@ def zscore(series: pd.Series, period: int = 20) -> pd.Series:
 
 # ── Statistical ───────────────────────────────────────────────────────────────
 
-def hurst_exponent(series: pd.Series, min_lag: int = 2, max_lag: int = 100) -> float:
-    """
-    Estimate Hurst exponent via R/S analysis.
-    H < 0.5 = mean-reverting, H = 0.5 = random walk, H > 0.5 = trending.
-    """
-    ts = series.dropna().values
-    if len(ts) < max_lag * 2:
-        return 0.5
+def _hurst_rs(ts: np.ndarray, min_lag: int = 2, max_lag: int = 100) -> float:
+    """Estimate Hurst exponent via R/S analysis."""
     lags = range(min_lag, min(max_lag, len(ts) // 2))
     tau = []
     for lag in lags:
@@ -137,7 +151,78 @@ def hurst_exponent(series: pd.Series, min_lag: int = 2, max_lag: int = 100) -> f
     if len(tau) < 2:
         return 0.5
     m = np.polyfit(np.log(list(lags)), np.log(tau), 1)
-    return m[0]
+    return float(m[0])
+
+
+def _hurst_dfa(ts: np.ndarray) -> float:
+    """Estimate Hurst exponent via Detrended Fluctuation Analysis (DFA)."""
+    n = len(ts)
+    y = np.cumsum(ts - ts.mean())
+
+    scales = np.unique(np.logspace(0.5, np.log10(n // 4), num=15).astype(int))
+    scales = scales[scales >= 4]
+    if len(scales) < 2:
+        return 0.5
+
+    fluct = []
+    for s in scales:
+        n_segments = n // s
+        if n_segments < 1:
+            continue
+        rms_list = []
+        for v in range(n_segments):
+            segment = y[v * s:(v + 1) * s]
+            x = np.arange(s)
+            coeffs = np.polyfit(x, segment, 1)
+            trend = np.polyval(coeffs, x)
+            rms_list.append(np.sqrt(np.mean((segment - trend) ** 2)))
+        if rms_list:
+            fluct.append(np.mean(rms_list))
+        else:
+            fluct.append(np.nan)
+
+    valid = [(s, f) for s, f in zip(scales, fluct) if f > 0 and np.isfinite(f)]
+    if len(valid) < 2:
+        return 0.5
+
+    log_s = np.log([v[0] for v in valid])
+    log_f = np.log([v[1] for v in valid])
+    m = np.polyfit(log_s, log_f, 1)
+    return float(m[0])
+
+
+# Rolling buffer for Hurst smoothing (last 3 values)
+_hurst_history: list[float] = []
+
+
+def hurst_exponent(
+    series: pd.Series, min_lag: int = 2, max_lag: int = 100, min_points: int = 100,
+) -> float:
+    """
+    Estimate Hurst exponent using R/S + DFA cross-check with smoothing.
+
+    H < 0.5 = mean-reverting, H = 0.5 = random walk, H > 0.5 = trending.
+    Returns H=0.5 (neutral) if fewer than ``min_points`` datapoints.
+    Final value is the average of the last 3 estimates (smoothing).
+    """
+    ts = series.dropna().values
+
+    # Minimum sample-size guard
+    if len(ts) < min_points:
+        return 0.5
+
+    h_rs = _hurst_rs(ts, min_lag, max_lag)
+    h_dfa = _hurst_dfa(ts)
+
+    # Average of R/S and DFA as cross-check
+    raw_h = (h_rs + h_dfa) / 2.0
+
+    # Smoothing: rolling average of last 3 values
+    _hurst_history.append(raw_h)
+    if len(_hurst_history) > 3:
+        _hurst_history.pop(0)
+
+    return float(np.mean(_hurst_history))
 
 
 def detect_rsi_divergence(
