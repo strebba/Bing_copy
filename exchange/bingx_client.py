@@ -200,6 +200,14 @@ class BingXClient:
         resp = await self._post(settings.BINGX_ENDPOINTS["place_order"], params)
         return resp.get("data", {})
 
+    async def get_order_detail(self, symbol: str, order_id: str) -> Dict[str, Any]:
+        """Query a single order by orderId to get fill details (avgPrice, executedQty)."""
+        resp = await self._get(
+            settings.BINGX_ENDPOINTS["order_detail"],
+            {"symbol": symbol, "orderId": order_id},
+        )
+        return resp.get("data", {})
+
     async def cancel_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
         resp = await self._delete(
             settings.BINGX_ENDPOINTS["cancel_order"],

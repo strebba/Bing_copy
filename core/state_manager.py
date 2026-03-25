@@ -25,6 +25,10 @@ class Position:
     exchange_position_id: Optional[str] = None
     sl_order_id: Optional[str] = None
     tp_order_id: Optional[str] = None
+    # Fill price tracking (H-7)
+    requested_price: Optional[float] = None
+    fill_price: Optional[float] = None
+    slippage_bps: float = 0.0
 
     @property
     def open_hours(self) -> float:
@@ -39,6 +43,37 @@ class Position:
 
     def risk_usdt(self) -> float:
         return abs(self.entry_price - self.stop_loss) * self.quantity
+
+
+def recalculate_sl_tp(
+    fill_price: float,
+    requested_price: float,
+    original_sl: float,
+    original_tp: float,
+    position_side: str,
+) -> tuple[float, float]:
+    """
+    Recalculate SL and TP relative to the actual fill price.
+    Preserves the absolute distance from the original requested price.
+    """
+    sl_distance = abs(requested_price - original_sl)
+    tp_distance = abs(requested_price - original_tp)
+
+    if position_side == "LONG":
+        new_sl = fill_price - sl_distance
+        new_tp = fill_price + tp_distance
+    else:
+        new_sl = fill_price + sl_distance
+        new_tp = fill_price - tp_distance
+
+    return new_sl, new_tp
+
+
+def compute_slippage_bps(fill_price: float, requested_price: float) -> float:
+    """Compute slippage in basis points (always positive)."""
+    if requested_price <= 0:
+        return 0.0
+    return abs(fill_price - requested_price) / requested_price * 10_000
 
 
 class StateManager:
@@ -56,6 +91,38 @@ class StateManager:
             "Position opened: %s %s entry=%.4f qty=%.4f",
             pos.symbol, pos.position_side, pos.entry_price, pos.quantity,
         )
+
+    def open_position_with_fill(
+        self,
+        pos: Position,
+        fill_price: float,
+        requested_price: float,
+    ) -> Position:
+        """
+        Open a position using the real fill price.
+        Recalculates SL/TP relative to fill_price and logs slippage.
+        """
+        slippage = compute_slippage_bps(fill_price, requested_price)
+        new_sl, new_tp = recalculate_sl_tp(
+            fill_price, requested_price, pos.stop_loss, pos.take_profit, pos.position_side,
+        )
+
+        pos.requested_price = requested_price
+        pos.fill_price = fill_price
+        pos.entry_price = fill_price
+        pos.slippage_bps = slippage
+        pos.stop_loss = new_sl
+        pos.take_profit = new_tp
+
+        logger.info(
+            "Fill price adjustment: %s %s requested=%.4f fill=%.4f "
+            "slippage=%.2f bps new_SL=%.4f new_TP=%.4f",
+            pos.symbol, pos.position_side,
+            requested_price, fill_price, slippage, new_sl, new_tp,
+        )
+
+        self.open_position(pos)
+        return pos
 
     def close_position(self, symbol: str, position_side: str) -> Optional[Position]:
         key = f"{symbol}_{position_side}"

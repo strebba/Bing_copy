@@ -46,6 +46,25 @@ class TradeJournal:
     def log_order(self, order_type: str, data: Dict) -> None:
         self.log(f"ORDER_{order_type}", data)
 
+    def log_order_fill(
+        self,
+        symbol: str,
+        direction: str,
+        requested_price: float,
+        fill_price: float,
+        slippage_bps: float,
+        executed_qty: float,
+    ) -> None:
+        """Log order fill with slippage information (H-7)."""
+        self.log("ORDER_FILL", {
+            "symbol": symbol,
+            "direction": direction,
+            "requested_price": round(requested_price, 6),
+            "fill_price": round(fill_price, 6),
+            "slippage_bps": round(slippage_bps, 2),
+            "executed_qty": round(executed_qty, 6),
+        })
+
     def log_trade_closed(
         self,
         symbol: str,
@@ -54,12 +73,20 @@ class TradeJournal:
         exit_price: float,
         pnl: float,
         reason: str,
+        requested_price: float = 0.0,
+        fill_price: float = 0.0,
+        slippage_bps: float = 0.0,
     ) -> None:
-        self.log("TRADE_CLOSED", {
+        data: Dict[str, Any] = {
             "symbol": symbol,
             "direction": direction,
             "entry": entry,
             "exit": exit_price,
             "pnl_usdt": round(pnl, 4),
             "reason": reason,
-        })
+        }
+        if fill_price > 0:
+            data["requested_price"] = round(requested_price, 6)
+            data["fill_price"] = round(fill_price, 6)
+            data["slippage_bps"] = round(slippage_bps, 2)
+        self.log("TRADE_CLOSED", data)
