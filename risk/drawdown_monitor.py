@@ -1,13 +1,21 @@
 """
 Drawdown monitoring and circuit-breaker logic.
+
+H-4 Fix: whenever the circuit breaker transitions to a new level (escalation
+OR recovery) an event is published on the EventBus so that subscribers
+(PortfolioManager, TelegramAlerter, …) react immediately without polling.
 """
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from config import settings
+
+if TYPE_CHECKING:
+    from core.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +77,16 @@ class DrawdownMonitor:
     """
     Tracks equity, peak, and current drawdown.
     Applies circuit breaker levels with cooldown periods.
+
+    Pass an EventBus instance to receive CIRCUIT_BREAKER_LEVEL_CHANGE events
+    whenever the breaker level transitions (escalation or recovery).
     """
 
-    def __init__(self, initial_equity: float = settings.INITIAL_CAPITAL) -> None:
+    def __init__(
+        self,
+        initial_equity: float = settings.INITIAL_CAPITAL,
+        event_bus: Optional["EventBus"] = None,
+    ) -> None:
         now = datetime.now(timezone.utc)
         self._state = DrawdownState(
             peak_equity=initial_equity,
@@ -81,6 +96,7 @@ class DrawdownMonitor:
             weekly_start_equity=initial_equity,
             weekly_start_date=now,
         )
+        self._event_bus = event_bus
 
     def update(self, equity: float) -> CircuitBreakerLevel:
         """Update equity and return the current circuit breaker level."""
@@ -103,19 +119,49 @@ class DrawdownMonitor:
         # Evaluate circuit breaker
         level = self._evaluate_level()
         if level != s.circuit_level:
+            prev_level = s.circuit_level
             cfg = CIRCUIT_BREAKER_CONFIG.get(level, {})
             cooldown_h = cfg.get("cooldown_hours", 0)
             if cooldown_h > 0:
                 s.halted_until = now + timedelta(hours=cooldown_h)
             s.circuit_level = level
             logger.warning(
-                "Circuit breaker: %s | DD=%.2f%% | halted_until=%s",
+                "Circuit breaker: %s → %s | DD=%.2f%% | halted_until=%s",
+                prev_level,
                 level,
                 self.current_drawdown() * 100,
                 s.halted_until,
             )
+            self._publish_level_change(prev_level, level)
 
         return level
+
+    def _publish_level_change(
+        self,
+        prev_level: "CircuitBreakerLevel",
+        new_level: "CircuitBreakerLevel",
+    ) -> None:
+        """Fire a CIRCUIT_BREAKER_LEVEL_CHANGE event (non-blocking, H-4)."""
+        if self._event_bus is None:
+            return
+
+        # Lazy import avoids circular dependency at module load time
+        from core.event_bus import Event, EventType  # noqa: PLC0415
+
+        cfg = CIRCUIT_BREAKER_CONFIG.get(new_level, {})
+        self._event_bus.publish_nowait(
+            Event(
+                type=EventType.CIRCUIT_BREAKER_LEVEL_CHANGE,
+                data={
+                    "previous_level": prev_level.value,
+                    "new_level": new_level.value,
+                    "current_dd": self.current_drawdown(),
+                    "size_multiplier": cfg.get("size_multiplier", 1.0),
+                    "cooldown_hours": cfg.get("cooldown_hours", 0),
+                    "timestamp": time.time(),
+                },
+            )
+        )
 
     def _evaluate_level(self) -> CircuitBreakerLevel:
         dd = self.current_drawdown()

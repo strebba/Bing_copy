@@ -19,6 +19,7 @@ from data.orderbook import OrderBookProcessor
 from exchange.bingx_client import BingXClient
 from exchange.bingx_ws import BingXWebSocket, MarketDataStream
 from exchange.order_manager import Order, OrderManager
+from monitoring.alerting import TelegramAlerter
 from risk.correlation_guard import CorrelationGuard
 from risk.drawdown_monitor import DrawdownMonitor
 from risk.emergency_stop import EmergencyStop
@@ -52,21 +53,33 @@ class TradingEngine:
         self._orderbook = OrderBookProcessor()
         self._funding = FundingRateTracker(self._client)
 
-        # Risk
-        self._dd_monitor = DrawdownMonitor(settings.INITIAL_CAPITAL)
-        self._sizer = PositionSizer()
-        self._risk_engine = RiskEngine(self._dd_monitor, self._sizer)
-        self._corr_guard = CorrelationGuard()
-        self._emergency = EmergencyStop()
-
-        # Strategy
-        self._portfolio = PortfolioManager(self._dd_monitor)
-
-        # State
+        # State / event bus — initialised before risk/strategy so they can
+        # subscribe during construction (H-4).
         self._state = StateManager()
         self._event_bus = EventBus()
         self._equity = settings.INITIAL_CAPITAL
         self._running = False
+
+        # Risk — pass event_bus so DrawdownMonitor publishes level-change events
+        self._dd_monitor = DrawdownMonitor(settings.INITIAL_CAPITAL, event_bus=self._event_bus)
+        self._sizer = PositionSizer()
+        self._corr_guard = CorrelationGuard()
+        self._emergency = EmergencyStop()
+
+        # Strategy — pass event_bus so PortfolioManager reacts to level changes
+        self._portfolio = PortfolioManager(self._dd_monitor, event_bus=self._event_bus)
+
+        # Wire RiskEngine with exchange client and state manager so it can
+        # reconcile live positions before every pre-trade check (C-1).
+        self._risk_engine = RiskEngine(
+            self._dd_monitor,
+            self._sizer,
+            exchange_client=self._client,
+            state_manager=self._state,
+        )
+
+        # Alerting — pass event_bus so Telegram fires on level changes (H-4)
+        self._alerter = TelegramAlerter(event_bus=self._event_bus)
 
         # Performance tracking (simple rolling stats)
         self._win_count = 0
@@ -99,25 +112,148 @@ class TradingEngine:
 
         # Subscribe event handlers
         self._event_bus.subscribe(EventType.CIRCUIT_BREAKER, self._on_circuit_breaker)
+        self._event_bus.subscribe(EventType.CIRCUIT_BREAKER_LEVEL_CHANGE, self._on_circuit_breaker_level_change)
         self._event_bus.subscribe(EventType.EMERGENCY_STOP, self._on_emergency_stop)
 
-        # Run all subsystems concurrently
-        await asyncio.gather(
-            self._ws.start(),
-            self._funding.start(settings.TRADING_PAIRS),
-            self._event_bus.process_events(),
-            self._strategy_loop(),
-            self._equity_loop(),
-            self._reconcile_loop(),
-            self._heartbeat_loop(),
-        )
+        # Run all subsystems with crash supervision
+        try:
+            await self._supervised_gather(
+                self._ws.start(),
+                self._funding.start(settings.TRADING_PAIRS),
+                self._event_bus.process_events(),
+                self._strategy_loop(),
+                self._equity_loop(),
+                self._reconcile_loop(),
+                self._heartbeat_loop(),
+                names=[
+                    "market_data",
+                    "funding_tracker",
+                    "event_bus",
+                    "strategy_loop",
+                    "equity_loop",
+                    "reconcile_loop",
+                    "heartbeat_loop",
+                ],
+            )
+        finally:
+            await self._graceful_shutdown()
+
+    async def _supervised_gather(self, *coros, names=None) -> None:
+        """
+        Run coroutines as supervised tasks (C-3).
+        On the first crash:
+          - Logs at CRITICAL level.
+          - Cancels remaining tasks (10 s grace period).
+          - Triggers emergency stop if the crashed task is critical.
+          - Re-raises the exception for graceful shutdown.
+        """
+        task_names = names or [str(i) for i in range(len(coros))]
+        tasks = [
+            asyncio.create_task(coro, name=n)
+            for coro, n in zip(coros, task_names)
+        ]
+        critical_tasks = {"market_data", "order_manager", "risk_engine"}
+
+        try:
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_EXCEPTION
+            )
+
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    logger.critical(
+                        "Task '%s' crashed: %s",
+                        task.get_name(), exc,
+                        exc_info=exc,
+                    )
+
+                    # Cancel remaining tasks with a grace period
+                    for p in pending:
+                        p.cancel()
+                    if pending:
+                        await asyncio.wait(pending, timeout=10)
+
+                    # Trigger emergency stop for critical subsystems (H-1: deduplication)
+                    if task.get_name() in critical_tasks:
+                        reason = f"Critical task '{task.get_name()}' crashed: {exc}"
+                        await self._emergency.trigger(reason)
+                        await self._event_bus.publish(
+                            Event(
+                                EventType.EMERGENCY_STOP,
+                                {"reason": reason},
+                            )
+                        )
+
+                    raise exc
+
+        except asyncio.CancelledError:
+            logger.info("Engine shutdown requested via CancelledError")
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.wait(tasks, timeout=10)
+            raise
+
+    async def _graceful_shutdown(self) -> None:
+        """
+        Orderly teardown called after supervised_gather exits (crash or normal).
+        - Sends Telegram alert.
+        - Closes all open positions (SL orders remain on exchange as fallback).
+        - Closes WebSocket and REST connections.
+        - Flushes log handlers.
+        """
+        logger.info("Initiating graceful shutdown...")
+        self._running = False
+
+        # Telegram alert — best-effort
+        try:
+            await self._alerter.send(
+                "🚨 *Bot crashed — emergency stop attivato*\n"
+                f"Reason: `{self._emergency.reason or 'engine shutdown'}`"
+            )
+        except Exception as exc:
+            logger.warning("Telegram alert failed during shutdown: %s", exc)
+
+        # Close all open positions (leave SL active as fallback)
+        try:
+            exchange_positions = await self._client.get_positions()
+            await self._emergency.close_all_positions(
+                self._order_mgr, exchange_positions
+            )
+        except Exception as exc:
+            logger.error("Failed to close positions during shutdown: %s", exc)
+
+        # Close WebSocket and REST connections
+        try:
+            await self._ws.stop()
+        except Exception as exc:
+            logger.warning("WS stop error: %s", exc)
+        try:
+            await self._funding.stop()
+        except Exception as exc:
+            logger.warning("Funding stop error: %s", exc)
+        try:
+            await self._client.close()
+        except Exception as exc:
+            logger.warning("Client close error: %s", exc)
+        try:
+            await self._alerter.close()
+        except Exception:
+            pass
+
+        # Flush log handlers
+        for handler in logging.root.handlers:
+            handler.flush()
+
+        logger.info("Trading engine stopped")
 
     async def stop(self) -> None:
+        """Public stop — signals loops to exit then runs graceful shutdown."""
         self._running = False
-        await self._ws.stop()
-        await self._funding.stop()
-        await self._client.close()
-        logger.info("Trading engine stopped")
+        await self._graceful_shutdown()
 
     # ── Signal processing ─────────────────────────────────────────────────────
 
@@ -177,8 +313,8 @@ class TradingEngine:
         except Exception:
             volume_24h = 0.0
 
-        # Pre-trade risk approval
-        approved, reason = self._risk_engine.approve_signal(
+        # Pre-trade risk approval (async — reconciles positions before check)
+        approved, reason = await self._risk_engine.approve_signal(
             signal=signal,
             equity=self._equity,
             volume_24h=volume_24h,
@@ -350,7 +486,7 @@ class TradingEngine:
                 level = self._dd_monitor.update(equity)
 
                 if self._dd_monitor.requires_emergency_close():
-                    self._emergency.activate("Max drawdown exceeded")
+                    await self._emergency.trigger("Max drawdown exceeded")
                     await self._event_bus.publish(
                         Event(EventType.EMERGENCY_STOP, {"reason": "max_dd"})
                     )
@@ -421,6 +557,15 @@ class TradingEngine:
     async def _on_circuit_breaker(self, event: Event) -> None:
         level = event.data.get("level")
         logger.warning("Circuit breaker event: %s", level)
+
+    async def _on_circuit_breaker_level_change(self, event: Event) -> None:
+        """Log circuit breaker level transitions (H-4). Subscribers handle the rest."""
+        prev = event.data.get("previous_level", "NONE")
+        new = event.data.get("new_level", "NONE")
+        mult = event.data.get("size_multiplier", 1.0)
+        logger.warning(
+            "Circuit breaker transition: %s → %s | size_multiplier=%.2f", prev, new, mult
+        )
 
     async def _on_emergency_stop(self, event: Event) -> None:
         logger.critical("EMERGENCY STOP: %s", event.data.get("reason"))
