@@ -197,11 +197,20 @@ class DrawdownMonitor:
         ) / self._state.weekly_start_equity
 
     def is_halted(self) -> bool:
+        """Check if trading is halted. Auto-resets when cooldown expires (H-8)."""
         now = datetime.now(timezone.utc)
-        return (
-            self._state.halted_until is not None
-            and now < self._state.halted_until
-        )
+        if self._state.halted_until is not None:
+            if now >= self._state.halted_until:
+                # Cooldown expired — auto-reset
+                logger.info(
+                    "Circuit breaker cooldown expired (was until %s), resetting",
+                    self._state.halted_until,
+                )
+                self._state.halted_until = None
+                self._state.circuit_level = CircuitBreakerLevel.NONE
+                return False
+            return True
+        return False
 
     def size_multiplier(self) -> float:
         """Return the current position size scalar from the circuit breaker."""

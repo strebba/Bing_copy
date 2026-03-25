@@ -361,7 +361,7 @@ class TradingEngine:
         except Exception as exc:
             logger.warning("Failed to set leverage for %s: %s", symbol, exc)
 
-        # Place entry market order
+        # Place entry market order and query fill price (H-7)
         entry_side = "BUY" if signal.direction == SignalDirection.LONG else "SELL"
         entry_order = Order(
             symbol=symbol,
@@ -370,45 +370,63 @@ class TradingEngine:
             order_type="MARKET",
             quantity=quantity,
         )
-        result = await self._order_mgr.submit_order(entry_order)
+        result, fill = await self._order_mgr.submit_market_order_with_fill(entry_order)
         if not result:
             return
 
-        # Place stop-loss order
+        # Determine actual fill price (fall back to signal price if query fails)
+        requested_price = signal.entry_price
+        if fill:
+            fill_price = fill.avg_price
+            filled_qty = fill.executed_qty
+        else:
+            fill_price = requested_price
+            filled_qty = quantity
+            logger.warning(
+                "Fill price unavailable for %s, using requested price %.4f",
+                symbol, requested_price,
+            )
+
+        # Build position with original SL/TP (will be recalculated)
+        pos = Position(
+            symbol=symbol,
+            position_side=signal.direction.value,
+            entry_price=requested_price,
+            quantity=filled_qty,
+            stop_loss=signal.stop_loss,
+            take_profit=signal.take_profit,
+            strategy_name=signal.strategy_name,
+        )
+
+        # Register position with fill price — recalculates SL/TP
+        pos = self._state.open_position_with_fill(pos, fill_price, requested_price)
+
+        # Place stop-loss order at recalculated SL
         sl_side = "SELL" if signal.direction == SignalDirection.LONG else "BUY"
         sl_order = Order(
             symbol=symbol,
             side=sl_side,
             position_side=signal.direction.value,
             order_type="STOP_MARKET",
-            quantity=quantity,
-            stop_price=signal.stop_loss,
+            quantity=filled_qty,
+            stop_price=pos.stop_loss,
             reduce_only=True,
         )
         sl_result = await self._order_mgr.submit_order(sl_order)
-
-        # Track position in state
-        pos = Position(
-            symbol=symbol,
-            position_side=signal.direction.value,
-            entry_price=signal.entry_price,
-            quantity=quantity,
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
-            strategy_name=signal.strategy_name,
-            sl_order_id=sl_result.get("orderId") if sl_result else None,
-        )
-        self._state.open_position(pos)
+        pos.sl_order_id = sl_result.get("orderId") if sl_result else None
 
         await self._event_bus.publish(Event(
             type=EventType.POSITION_OPENED,
             data={
                 "symbol": symbol,
                 "direction": signal.direction.value,
-                "entry": signal.entry_price,
-                "sl": signal.stop_loss,
-                "tp": signal.take_profit,
-                "qty": quantity,
+                "requested_price": requested_price,
+                "fill_price": fill_price,
+                "slippage_bps": pos.slippage_bps,
+                "entry": fill_price,
+                "sl": pos.stop_loss,
+                "tp": pos.take_profit,
+                "qty": filled_qty,
                 "strategy": signal.strategy_name,
                 "risk_usdt": risk_usdt,
             },

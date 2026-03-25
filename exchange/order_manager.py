@@ -6,6 +6,7 @@ Bracket orders (SL + TP) are placed immediately after every entry so that
 positions are protected even when the bot is offline.  When one side fires,
 the other is automatically cancelled.
 """
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
@@ -17,6 +18,16 @@ from exchange.rate_limiter import ORDER_LIMITER, REQUEST_LIMITER
 logger = logging.getLogger(__name__)
 
 FILL_TIMEOUT_S = 5.0    # Max wait for fill confirmation
+FILL_POLL_INTERVAL_S = 0.5  # Poll interval for fill status
+
+
+@dataclass
+class FillResult:
+    """Result of a fill price query after market order execution."""
+    order_id: str
+    avg_price: float
+    executed_qty: float
+    status: str
 
 
 class Order:
@@ -105,6 +116,74 @@ class OrderManager:
             return None
         finally:
             self._pending_ids.discard(order.client_order_id)
+
+    async def query_fill(self, symbol: str, order_id: str) -> Optional[FillResult]:
+        """
+        Query the executed order to get the real fill price.
+        Polls until the order is FILLED or timeout is reached.
+        Returns FillResult with avgPrice and executedQty.
+        """
+        await REQUEST_LIMITER.acquire()
+        elapsed = 0.0
+        while elapsed < FILL_TIMEOUT_S:
+            try:
+                detail = await self._client.get_order_detail(symbol, order_id)
+                status = detail.get("status", "")
+                avg_price = float(detail.get("avgPrice", 0))
+                executed_qty = float(detail.get("executedQty", 0))
+
+                if status == "FILLED" and avg_price > 0:
+                    logger.info(
+                        "Fill confirmed: %s orderId=%s avgPrice=%.6f executedQty=%.6f",
+                        symbol, order_id, avg_price, executed_qty,
+                    )
+                    return FillResult(
+                        order_id=order_id,
+                        avg_price=avg_price,
+                        executed_qty=executed_qty,
+                        status=status,
+                    )
+
+                if status in ("CANCELLED", "EXPIRED", "FAILED"):
+                    logger.warning(
+                        "Order not filled: %s orderId=%s status=%s",
+                        symbol, order_id, status,
+                    )
+                    return None
+
+            except Exception as exc:
+                logger.warning("Fill query error for %s: %s", order_id, exc)
+
+            await asyncio.sleep(FILL_POLL_INTERVAL_S)
+            elapsed += FILL_POLL_INTERVAL_S
+
+        logger.warning(
+            "Fill query timeout after %.1fs: %s orderId=%s",
+            FILL_TIMEOUT_S, symbol, order_id,
+        )
+        return None
+
+    async def submit_market_order_with_fill(
+        self, order: Order
+    ) -> tuple[Optional[Dict[str, Any]], Optional[FillResult]]:
+        """
+        Submit a MARKET order and immediately query for the fill price.
+        Returns (placement_result, fill_result).
+        """
+        result = await self.submit_order(order)
+        if not result:
+            return None, None
+
+        order_id = result.get("orderId")
+        if not order_id:
+            return result, None
+
+        fill = await self.query_fill(order.symbol, order_id)
+        if fill:
+            order.avg_price = fill.avg_price
+            order.filled_qty = fill.executed_qty
+            order.status = fill.status
+        return result, fill
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         await REQUEST_LIMITER.acquire()
