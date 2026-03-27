@@ -2,6 +2,7 @@
 BingX REST API client for Perpetual Futures.
 Handles authentication, request signing, and all REST endpoints.
 """
+
 import asyncio
 import hashlib
 import hmac
@@ -41,22 +42,30 @@ def with_retry(
                 except aiohttp.ClientResponseError as e:
                     if e.status in retryable_status:
                         last_exception = e
-                        delay = base_delay * (2 ** attempt)
+                        delay = base_delay * (2**attempt)
                         if e.status == 429:
                             delay = max(delay, 10.0)
                         logger.warning(
                             "API call %s failed with %d, retry %d/%d in %.1fs",
-                            func.__name__, e.status, attempt + 1, max_retries, delay,
+                            func.__name__,
+                            e.status,
+                            attempt + 1,
+                            max_retries,
+                            delay,
                         )
                         await asyncio.sleep(delay)
                     else:
                         raise
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     last_exception = e
-                    delay = base_delay * (2 ** attempt)
+                    delay = base_delay * (2**attempt)
                     logger.warning(
                         "API call %s failed: %s, retry %d/%d in %.1fs",
-                        func.__name__, e, attempt + 1, max_retries, delay,
+                        func.__name__,
+                        e,
+                        attempt + 1,
+                        max_retries,
+                        delay,
                     )
                     await asyncio.sleep(delay)
             raise last_exception  # type: ignore[misc]
@@ -83,17 +92,20 @@ def with_order_retry(
         async def wrapper(self: "BingXClient", *args: Any, **kwargs: Any) -> Any:
             last_exception: Optional[Exception] = None
             symbol = kwargs.get("symbol") or (args[0] if args else None)
-            position_side = kwargs.get("position_side") or (args[2] if len(args) > 2 else None)
+            position_side = kwargs.get("position_side") or (
+                args[2] if len(args) > 2 else None
+            )
 
             for attempt in range(max_retries + 1):
                 try:
                     return await func(self, *args, **kwargs)
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     last_exception = e
-                    delay = base_delay * (2 ** attempt)
+                    delay = base_delay * (2**attempt)
                     logger.warning(
                         "Order placement %s timed out: %s, checking positions...",
-                        func.__name__, e,
+                        func.__name__,
+                        e,
                     )
                     # Check if the order actually went through
                     if symbol and position_side:
@@ -105,7 +117,8 @@ def with_order_retry(
                                     if qty > 0:
                                         logger.info(
                                             "Order for %s %s found in positions despite timeout, skipping retry",
-                                            symbol, position_side,
+                                            symbol,
+                                            position_side,
                                         )
                                         return pos
                         except Exception as check_err:
@@ -113,18 +126,23 @@ def with_order_retry(
 
                     logger.warning(
                         "Order not found in positions, retry %d/%d in %.1fs",
-                        attempt + 1, max_retries, delay,
+                        attempt + 1,
+                        max_retries,
+                        delay,
                     )
                     await asyncio.sleep(delay)
                 except aiohttp.ClientResponseError as e:
                     if e.status in RETRYABLE_STATUSES:
                         last_exception = e
-                        delay = base_delay * (2 ** attempt)
+                        delay = base_delay * (2**attempt)
                         if e.status == 429:
                             delay = max(delay, 10.0)
                         logger.warning(
                             "Order placement failed with %d, retry %d/%d in %.1fs",
-                            e.status, attempt + 1, max_retries, delay,
+                            e.status,
+                            attempt + 1,
+                            max_retries,
+                            delay,
                         )
                         await asyncio.sleep(delay)
                     else:
@@ -226,6 +244,21 @@ class BingXClient:
             self._raise_if_error(data)
             return data
 
+    async def _put(
+        self, endpoint: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        await self._ensure_session()
+        p = self._build_params(params or {})
+        headers = {
+            "X-BX-APIKEY": self._api_key,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        url = self._base_url + endpoint
+        async with self._session.put(url, data=p, headers=headers) as resp:
+            data = await resp.json()
+            self._raise_if_error(data)
+            return data
+
     @staticmethod
     def _raise_if_error(data: Dict[str, Any]) -> None:
         code = data.get("code", 0)
@@ -264,7 +297,11 @@ class BingXClient:
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
     ) -> List[List]:
-        params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+        }
         if start_time:
             params["startTime"] = start_time
         if end_time:
@@ -301,9 +338,9 @@ class BingXClient:
     async def place_order(
         self,
         symbol: str,
-        side: str,            # "BUY" | "SELL"
-        position_side: str,   # "LONG" | "SHORT"
-        order_type: str,      # "MARKET" | "LIMIT" | "STOP_MARKET"
+        side: str,  # "BUY" | "SELL"
+        position_side: str,  # "LONG" | "SHORT"
+        order_type: str,  # "MARKET" | "LIMIT" | "STOP_MARKET"
         quantity: float,
         price: Optional[float] = None,
         stop_price: Optional[float] = None,
@@ -344,7 +381,9 @@ class BingXClient:
         return resp.get("data", {})
 
     @with_retry()
-    async def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> None:
+    async def set_leverage(
+        self, symbol: str, leverage: int, side: str = "LONG"
+    ) -> None:
         await self._post(
             settings.BINGX_ENDPOINTS["leverage"],
             {"symbol": symbol, "leverage": leverage, "side": side},
@@ -355,4 +394,19 @@ class BingXClient:
         await self._post(
             settings.BINGX_ENDPOINTS["margin_type"],
             {"symbol": symbol, "marginType": margin_type},
+        )
+
+    @with_retry()
+    async def create_listen_key(self) -> str:
+        resp = await self._post(settings.BINGX_ENDPOINTS["user_data_stream"])
+        listen_key = resp.get("data", {}).get("listenKey", "")
+        if not listen_key:
+            raise RuntimeError("Failed to create listen key")
+        return listen_key
+
+    @with_retry()
+    async def refresh_listen_key(self, listen_key: str) -> None:
+        await self._put(
+            settings.BINGX_ENDPOINTS["user_data_stream"],
+            {"listenKey": listen_key},
         )

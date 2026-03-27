@@ -6,6 +6,7 @@ Bracket orders (SL + TP) are placed immediately after every entry so that
 positions are protected even when the bot is offline.  When one side fires,
 the other is automatically cancelled.
 """
+
 import asyncio
 import logging
 import uuid
@@ -17,13 +18,14 @@ from exchange.rate_limiter import ORDER_LIMITER, REQUEST_LIMITER
 
 logger = logging.getLogger(__name__)
 
-FILL_TIMEOUT_S = 5.0    # Max wait for fill confirmation
+FILL_TIMEOUT_S = 5.0  # Max wait for fill confirmation
 FILL_POLL_INTERVAL_S = 0.5  # Poll interval for fill status
 
 
 @dataclass
 class FillResult:
     """Result of a fill price query after market order execution."""
+
     order_id: str
     avg_price: float
     executed_qty: float
@@ -60,8 +62,9 @@ class Order:
 @dataclass
 class BracketIds:
     """Tracks live SL and TP exchange order IDs for an open position."""
+
     symbol: str
-    position_side: str          # "LONG" or "SHORT"
+    position_side: str  # "LONG" or "SHORT"
     sl_order_id: Optional[str] = None
     tp_order_id: Optional[str] = None
 
@@ -74,7 +77,7 @@ class OrderManager:
 
     def __init__(self, client: BingXClient) -> None:
         self._client = client
-        self._pending_ids: set = set()          # client_order_ids in flight
+        self._pending_ids: set = set()  # client_order_ids in flight
         # key: (symbol, position_side) → BracketIds
         self._brackets: Dict[Tuple[str, str], BracketIds] = {}
 
@@ -135,7 +138,10 @@ class OrderManager:
                 if status == "FILLED" and avg_price > 0:
                     logger.info(
                         "Fill confirmed: %s orderId=%s avgPrice=%.6f executedQty=%.6f",
-                        symbol, order_id, avg_price, executed_qty,
+                        symbol,
+                        order_id,
+                        avg_price,
+                        executed_qty,
                     )
                     return FillResult(
                         order_id=order_id,
@@ -147,7 +153,9 @@ class OrderManager:
                 if status in ("CANCELLED", "EXPIRED", "FAILED"):
                     logger.warning(
                         "Order not filled: %s orderId=%s status=%s",
-                        symbol, order_id, status,
+                        symbol,
+                        order_id,
+                        status,
                     )
                     return None
 
@@ -159,7 +167,9 @@ class OrderManager:
 
         logger.warning(
             "Fill query timeout after %.1fs: %s orderId=%s",
-            FILL_TIMEOUT_S, symbol, order_id,
+            FILL_TIMEOUT_S,
+            symbol,
+            order_id,
         )
         return None
 
@@ -225,7 +235,7 @@ class OrderManager:
     async def place_entry_with_brackets(
         self,
         symbol: str,
-        position_side: str,    # "LONG" or "SHORT"
+        position_side: str,  # "LONG" or "SHORT"
         quantity: float,
         sl_price: float,
         tp_price: float,
@@ -254,7 +264,9 @@ class OrderManager:
         entry_result = await self.submit_order(entry_order)
         if entry_result is None:
             logger.error(
-                "Entry failed for %s %s — bracket orders NOT placed", symbol, position_side
+                "Entry failed for %s %s — bracket orders NOT placed",
+                symbol,
+                position_side,
             )
             return {"entry_result": None, "sl_result": None, "tp_result": None}
 
@@ -293,13 +305,73 @@ class OrderManager:
 
         logger.info(
             "Brackets registered for %s %s: SL=%s TP=%s",
-            symbol, position_side, bracket.sl_order_id, bracket.tp_order_id,
+            symbol,
+            position_side,
+            bracket.sl_order_id,
+            bracket.tp_order_id,
         )
         return {
             "entry_result": entry_result,
             "sl_result": sl_result,
             "tp_result": tp_result,
         }
+
+    async def place_brackets(
+        self,
+        symbol: str,
+        position_side: str,
+        quantity: float,
+        sl_price: float,
+        tp_price: float,
+    ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        Place SL and TP bracket orders for an already-open position.
+        Used after fill price is known and SL/TP have been recalculated.
+
+        Returns (sl_result, tp_result).
+        """
+        close_side = "SELL" if position_side == "LONG" else "BUY"
+
+        sl_order = Order(
+            symbol=symbol,
+            side=close_side,
+            position_side=position_side,
+            order_type="STOP_MARKET",
+            quantity=quantity,
+            stop_price=sl_price,
+            reduce_only=True,
+        )
+        sl_result = await self.submit_order(sl_order)
+
+        tp_order = Order(
+            symbol=symbol,
+            side=close_side,
+            position_side=position_side,
+            order_type="TAKE_PROFIT_MARKET",
+            quantity=quantity,
+            stop_price=tp_price,
+            reduce_only=True,
+        )
+        tp_result = await self.submit_order(tp_order)
+
+        bracket = BracketIds(
+            symbol=symbol,
+            position_side=position_side,
+            sl_order_id=sl_result.get("orderId") if sl_result else None,
+            tp_order_id=tp_result.get("orderId") if tp_result else None,
+        )
+        self._brackets[(symbol, position_side)] = bracket
+
+        logger.info(
+            "Brackets placed for %s %s: SL=%.4f TP=%.4f SL_id=%s TP_id=%s",
+            symbol,
+            position_side,
+            sl_price,
+            tp_price,
+            bracket.sl_order_id,
+            bracket.tp_order_id,
+        )
+        return sl_result, tp_result
 
     async def on_sl_triggered(self, symbol: str, position_side: str) -> bool:
         """
@@ -385,7 +457,10 @@ class OrderManager:
             bracket.tp_order_id = result.get("orderId")
             logger.info(
                 "TP updated for %s %s: price=%.4f new_id=%s",
-                symbol, position_side, new_tp_price, bracket.tp_order_id,
+                symbol,
+                position_side,
+                new_tp_price,
+                bracket.tp_order_id,
             )
             return True
         return False

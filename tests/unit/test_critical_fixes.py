@@ -3,6 +3,7 @@ Unit tests for critical fixes:
   C-1 — Position Count Guard with exchange reconciliation + cache TTL
   C-3 — asyncio.gather() Crash Propagation & supervised_gather
 """
+
 import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,6 +16,7 @@ from risk.risk_engine import RiskEngine, _POSITION_CACHE_TTL
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
 
 def _make_engine(
     exchange_positions=None,
@@ -64,15 +66,15 @@ def _make_5_exchange_positions():
 
 # ── C-1: Position Count Guard ──────────────────────────────────────────────────
 
-class TestPositionCountGuard:
 
+class TestPositionCountGuard:
     @pytest.mark.asyncio
     async def test_blocks_when_5_real_positions_and_max_5(self):
         """With 5 real positions on exchange and MAX=5, approve_signal must block."""
         exchange_pos = _make_5_exchange_positions()
         engine, client, state = _make_engine(
             exchange_positions=exchange_pos,
-            local_position_count=5,   # state reflects real count after reconcile
+            local_position_count=5,  # state reflects real count after reconcile
         )
 
         # After reconciliation the state.count() returns 5
@@ -106,7 +108,7 @@ class TestPositionCountGuard:
         exchange_pos = _make_5_exchange_positions()
         engine, client, state = _make_engine(
             exchange_positions=exchange_pos,
-            local_position_count=3,   # stale local count BEFORE reconcile
+            local_position_count=3,  # stale local count BEFORE reconcile
         )
 
         # Simulate that reconciliation updates the count to the real value
@@ -205,13 +207,14 @@ class TestPositionCountGuard:
         """Without exchange_client, reconciliation is silently skipped."""
         dd = DrawdownMonitor(10_000)
         sizer = PositionSizer()
-        engine = RiskEngine(dd, sizer)   # no client, no state
+        engine = RiskEngine(dd, sizer)  # no client, no state
 
         # Must not raise
         await engine._reconcile_positions_if_stale()
 
 
 # ── C-3: Supervised Gather / Crash Propagation ────────────────────────────────
+
 
 class TestSupervisedGather:
     """
@@ -378,3 +381,263 @@ class TestSupervisedGather:
         await engine._graceful_shutdown()
         engine._client.get_positions.assert_awaited_once()
         engine._emergency.close_all_positions.assert_awaited_once()
+
+
+# ── C-2 / C-4: TP in main flow — _process_signal bracket integration ──────────
+
+
+class TestProcessSignalBrackets:
+    """
+    Verify that _process_signal():
+      1. Calls submit_market_order_with_fill for entry
+      2. Calls place_brackets (not raw submit_order) for SL+TP
+      3. All 3 orders (MARKET + STOP_MARKET + TAKE_PROFIT_MARKET) are placed
+      4. If either SL or TP fails, both are cancelled and the function returns early
+      5. POSITION_OPENED event is only published when brackets succeed
+    """
+
+    def _build_engine(self):
+        """Same pattern as TestSupervisedGather._build_engine()."""
+        from core.engine import TradingEngine
+
+        with (
+            patch("core.engine.BingXClient"),
+            patch("core.engine.OrderManager"),
+            patch("core.engine.BingXWebSocket"),
+            patch("core.engine.MarketDataStream"),
+            patch("core.engine.MarketDataManager"),
+            patch("core.engine.OrderBookProcessor"),
+            patch("core.engine.FundingRateTracker"),
+            patch("core.engine.DrawdownMonitor"),
+            patch("core.engine.PositionSizer"),
+            patch("core.engine.CorrelationGuard"),
+            patch("core.engine.EmergencyStop"),
+            patch("core.engine.PortfolioManager"),
+            patch("core.engine.StateManager"),
+            patch("core.engine.EventBus"),
+            patch("core.engine.TelegramAlerter"),
+            patch("core.engine.RiskEngine"),
+        ):
+            engine = TradingEngine()
+
+        engine._emergency = MagicMock()
+        engine._emergency.is_active = False
+        engine._emergency.reason = ""
+        engine._emergency.trigger = AsyncMock(return_value=0)
+        engine._event_bus = MagicMock()
+        engine._event_bus.publish = AsyncMock()
+        engine._alerter = MagicMock()
+        engine._alerter.send = AsyncMock(return_value=True)
+        engine._alerter.close = AsyncMock()
+        engine._client = MagicMock()
+        engine._client.get_positions = AsyncMock(return_value=[])
+        engine._client.close = AsyncMock()
+        engine._client.get_ticker = AsyncMock(return_value={"quoteVolume": "100000000"})
+        engine._ws = MagicMock()
+        engine._ws.stop = AsyncMock()
+        engine._funding = MagicMock()
+        engine._funding.stop = AsyncMock()
+        engine._emergency.close_all_positions = AsyncMock(return_value=0)
+        engine._order_mgr = MagicMock()
+        engine._orderbook = MagicMock()
+        engine._orderbook.spread_pct = MagicMock(return_value=0.0001)
+        engine._dd_monitor = MagicMock()
+        engine._sizer = MagicMock()
+        engine._sizer.quantity_from_risk = MagicMock(return_value=0.01)
+        engine._portfolio = MagicMock()
+        engine._risk_engine = MagicMock()
+        engine._risk_engine.pre_trade_check = AsyncMock(return_value=(True, ""))
+        engine._risk_engine.calculate_order_size = MagicMock(return_value=100.0)
+        engine._state = MagicMock()
+        engine._state.get_position = MagicMock(return_value=None)
+        engine._state.open_position_with_fill = MagicMock()
+        engine._state.total_open_risk_usdt = MagicMock(return_value=0.0)
+        engine._state.all_positions = MagicMock(return_value=[])
+        engine._market_data = MagicMock()
+        engine._client.set_leverage = AsyncMock()
+        return engine
+
+    def _make_signal(self, direction=None):
+        from strategy.base_strategy import Signal, SignalDirection
+
+        if direction is None:
+            direction = SignalDirection.LONG
+
+        return Signal(
+            direction=direction,
+            symbol="BTC-USDT",
+            strategy_name="alpha",
+            entry_price=100.0,
+            stop_loss=97.0,
+            take_profit=106.0,
+            risk_pct=0.01,
+            confidence=0.8,
+            trailing_activation_rr=1.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_process_signal_places_all_three_orders(self):
+        """_process_signal must place MARKET entry + STOP_MARKET SL + TAKE_PROFIT_MARKET TP."""
+        from unittest.mock import patch
+
+        engine = self._build_engine()
+
+        from exchange.order_manager import FillResult
+        from unittest.mock import MagicMock as MockMagicMock
+
+        fill_result = FillResult(
+            order_id="ENTRY-001",
+            avg_price=100.2,
+            executed_qty=0.01,
+            status="FILLED",
+        )
+        engine._order_mgr.submit_market_order_with_fill = AsyncMock(
+            return_value=(MockMagicMock(orderId="ENTRY-001"), fill_result)
+        )
+        engine._order_mgr.place_brackets = AsyncMock(
+            return_value=(
+                MockMagicMock(orderId="SL-001"),
+                MockMagicMock(orderId="TP-001"),
+            )
+        )
+
+        pos_mock = MockMagicMock()
+        pos_mock.slippage_bps = 2.0
+        pos_mock.stop_loss = 96.9
+        pos_mock.take_profit = 106.5
+        engine._state.open_position_with_fill = MagicMock(return_value=pos_mock)
+
+        with patch("core.engine.get_pair_config") as mock_pair_config:
+            mock_cfg = MagicMock()
+            mock_cfg.default_leverage = 5
+            mock_cfg.lot_size = 0.001
+            mock_pair_config.return_value = mock_cfg
+
+            signal = self._make_signal()
+            await engine._process_signal(signal)
+
+        engine._order_mgr.submit_market_order_with_fill.assert_called_once()
+        engine._order_mgr.place_brackets.assert_called_once()
+
+        bracket_call = engine._order_mgr.place_brackets.call_args
+        assert bracket_call.kwargs["symbol"] == "BTC-USDT"
+        assert bracket_call.kwargs["position_side"] == "LONG"
+        assert bracket_call.kwargs["quantity"] == 0.01
+        assert bracket_call.kwargs["sl_price"] == 96.9
+        assert bracket_call.kwargs["tp_price"] == 106.5
+
+        engine._event_bus.publish.assert_called_once()
+        event = engine._event_bus.publish.call_args[0][0]
+        assert event.type.value == "position_opened"
+
+    @pytest.mark.asyncio
+    async def test_process_signal_cancels_brackets_on_partial_failure(self):
+        """If SL or TP fails, both must be cancelled and POSITION_OPENED not fired."""
+        from unittest.mock import patch
+
+        engine = self._build_engine()
+
+        from exchange.order_manager import FillResult
+        from unittest.mock import MagicMock as MockMagicMock
+
+        fill_result = FillResult(
+            order_id="ENTRY-001",
+            avg_price=100.2,
+            executed_qty=0.01,
+            status="FILLED",
+        )
+        engine._order_mgr.submit_market_order_with_fill = AsyncMock(
+            return_value=(MockMagicMock(orderId="ENTRY-001"), fill_result)
+        )
+        engine._order_mgr.place_brackets = AsyncMock(
+            return_value=(None, MockMagicMock(orderId="TP-001"))
+        )
+        engine._order_mgr.cancel_order = AsyncMock(return_value=True)
+
+        pos_mock = MockMagicMock()
+        pos_mock.slippage_bps = 2.0
+        pos_mock.stop_loss = 96.9
+        pos_mock.take_profit = 106.5
+        engine._state.open_position_with_fill = MagicMock(return_value=pos_mock)
+
+        with patch("core.engine.get_pair_config") as mock_pair_config:
+            mock_cfg = MagicMock()
+            mock_cfg.default_leverage = 5
+            mock_cfg.lot_size = 0.001
+            mock_pair_config.return_value = mock_cfg
+
+            signal = self._make_signal()
+            await engine._process_signal(signal)
+
+        engine._order_mgr.cancel_order.assert_called()
+        engine._event_bus.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_process_signal_returns_early_on_entry_failure(self):
+        """If entry order fails, place_brackets must never be called."""
+        from unittest.mock import patch
+
+        engine = self._build_engine()
+        engine._order_mgr.submit_market_order_with_fill = AsyncMock(
+            return_value=(None, None)
+        )
+        engine._order_mgr.place_brackets = AsyncMock()
+
+        with patch("core.engine.get_pair_config") as mock_pair_config:
+            mock_cfg = MagicMock()
+            mock_cfg.default_leverage = 5
+            mock_cfg.lot_size = 0.001
+            mock_pair_config.return_value = mock_cfg
+
+            signal = self._make_signal()
+            await engine._process_signal(signal)
+
+        engine._order_mgr.place_brackets.assert_not_called()
+        engine._event_bus.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_process_signal_short_direction(self):
+        """SHORT signal must place brackets with SHORT position_side."""
+        from unittest.mock import patch
+        from strategy.base_strategy import SignalDirection
+
+        engine = self._build_engine()
+
+        from exchange.order_manager import FillResult
+        from unittest.mock import MagicMock as MockMagicMock
+
+        fill_result = FillResult(
+            order_id="ENTRY-S001",
+            avg_price=100.0,
+            executed_qty=0.01,
+            status="FILLED",
+        )
+        engine._order_mgr.submit_market_order_with_fill = AsyncMock(
+            return_value=(MockMagicMock(orderId="ENTRY-S001"), fill_result)
+        )
+        engine._order_mgr.place_brackets = AsyncMock(
+            return_value=(
+                MockMagicMock(orderId="SL-S001"),
+                MockMagicMock(orderId="TP-S001"),
+            )
+        )
+
+        pos_mock = MockMagicMock()
+        pos_mock.slippage_bps = 0.0
+        pos_mock.stop_loss = 103.0
+        pos_mock.take_profit = 95.5
+        engine._state.open_position_with_fill = MagicMock(return_value=pos_mock)
+
+        with patch("core.engine.get_pair_config") as mock_pair_config:
+            mock_cfg = MagicMock()
+            mock_cfg.default_leverage = 5
+            mock_cfg.lot_size = 0.001
+            mock_pair_config.return_value = mock_cfg
+
+            signal = self._make_signal(direction=SignalDirection.SHORT)
+            await engine._process_signal(signal)
+
+        bracket_call = engine._order_mgr.place_brackets.call_args
+        assert bracket_call.kwargs["position_side"] == "SHORT"
+        assert bracket_call.kwargs["sl_price"] == 103.0
+        assert bracket_call.kwargs["tp_price"] == 95.5

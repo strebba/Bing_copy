@@ -2,6 +2,7 @@
 Trading Engine — main orchestrator.
 Runs the event loop, processes signals, manages orders, enforces risk rules.
 """
+
 import asyncio
 import logging
 import time
@@ -17,7 +18,7 @@ from data.funding_rate import FundingRateTracker
 from data.market_data import MarketDataManager
 from data.orderbook import OrderBookProcessor
 from exchange.bingx_client import BingXClient
-from exchange.bingx_ws import BingXWebSocket, MarketDataStream
+from exchange.bingx_ws import BingXWebSocket, MarketDataStream, UserDataStream
 from exchange.order_manager import Order, OrderManager
 from monitoring.alerting import TelegramAlerter
 from risk.correlation_guard import CorrelationGuard
@@ -30,9 +31,9 @@ from strategy.portfolio_manager import PortfolioManager
 
 logger = logging.getLogger(__name__)
 
-CANDLE_EVAL_INTERVAL_S = 60    # Evaluate signals every minute
-RECONCILE_INTERVAL_S = 300     # Reconcile positions every 5 minutes
-EQUITY_POLL_INTERVAL_S = 60    # Poll equity every minute
+CANDLE_EVAL_INTERVAL_S = 60  # Evaluate signals every minute
+RECONCILE_INTERVAL_S = 60  # Reconcile positions every 60s (fallback; primary is WS)
+EQUITY_POLL_INTERVAL_S = 60  # Poll equity every minute
 
 
 class TradingEngine:
@@ -60,8 +61,15 @@ class TradingEngine:
         self._equity = settings.INITIAL_CAPITAL
         self._running = False
 
+        # User data stream (needs _state and _event_bus)
+        self._user_stream = UserDataStream(
+            self._client, self._order_mgr, self._state, self._event_bus
+        )
+
         # Risk — pass event_bus so DrawdownMonitor publishes level-change events
-        self._dd_monitor = DrawdownMonitor(settings.INITIAL_CAPITAL, event_bus=self._event_bus)
+        self._dd_monitor = DrawdownMonitor(
+            settings.INITIAL_CAPITAL, event_bus=self._event_bus
+        )
         self._sizer = PositionSizer()
         self._corr_guard = CorrelationGuard()
         self._emergency = EmergencyStop()
@@ -105,16 +113,15 @@ class TradingEngine:
 
         # Setup WebSocket subscriptions
         for symbol in settings.TRADING_PAIRS:
-            self._market_stream.subscribe_kline(
-                symbol, "1H", self._on_kline_update
-            )
-            self._market_stream.subscribe_depth(
-                symbol, self._on_depth_update
-            )
+            self._market_stream.subscribe_kline(symbol, "1H", self._on_kline_update)
+            self._market_stream.subscribe_depth(symbol, self._on_depth_update)
 
         # Subscribe event handlers
         self._event_bus.subscribe(EventType.CIRCUIT_BREAKER, self._on_circuit_breaker)
-        self._event_bus.subscribe(EventType.CIRCUIT_BREAKER_LEVEL_CHANGE, self._on_circuit_breaker_level_change)
+        self._event_bus.subscribe(
+            EventType.CIRCUIT_BREAKER_LEVEL_CHANGE,
+            self._on_circuit_breaker_level_change,
+        )
         self._event_bus.subscribe(EventType.EMERGENCY_STOP, self._on_emergency_stop)
 
         # Wire Telegram alerter to event bus (H-2)
@@ -128,6 +135,7 @@ class TradingEngine:
         try:
             await self._supervised_gather(
                 self._ws.start(),
+                self._user_stream.start(),
                 self._funding.start(settings.TRADING_PAIRS),
                 self._event_bus.process_events(),
                 self._strategy_loop(),
@@ -138,6 +146,7 @@ class TradingEngine:
                 self._alerter.bot_polling_loop(),
                 names=[
                     "market_data",
+                    "user_data_stream",
                     "funding_tracker",
                     "event_bus",
                     "strategy_loop",
@@ -162,8 +171,7 @@ class TradingEngine:
         """
         task_names = names or [str(i) for i in range(len(coros))]
         tasks = [
-            asyncio.create_task(coro, name=n)
-            for coro, n in zip(coros, task_names)
+            asyncio.create_task(coro, name=n) for coro, n in zip(coros, task_names)
         ]
         critical_tasks = {"market_data", "order_manager", "risk_engine"}
 
@@ -179,7 +187,8 @@ class TradingEngine:
                 if exc is not None:
                     logger.critical(
                         "Task '%s' crashed: %s",
-                        task.get_name(), exc,
+                        task.get_name(),
+                        exc,
                         exc_info=exc,
                     )
 
@@ -244,6 +253,10 @@ class TradingEngine:
             await self._ws.stop()
         except Exception as exc:
             logger.warning("WS stop error: %s", exc)
+        try:
+            await self._user_stream.stop()
+        except Exception as exc:
+            logger.warning("User data stream stop error: %s", exc)
         try:
             await self._funding.stop()
         except Exception as exc:
@@ -370,8 +383,10 @@ class TradingEngine:
             order_type="MARKET",
             quantity=quantity,
         )
-        result, fill = await self._order_mgr.submit_market_order_with_fill(entry_order)
-        if not result:
+        entry_result, fill = await self._order_mgr.submit_market_order_with_fill(
+            entry_order
+        )
+        if not entry_result:
             return
 
         # Determine actual fill price (fall back to signal price if query fails)
@@ -384,10 +399,11 @@ class TradingEngine:
             filled_qty = quantity
             logger.warning(
                 "Fill price unavailable for %s, using requested price %.4f",
-                symbol, requested_price,
+                symbol,
+                requested_price,
             )
 
-        # Build position with original SL/TP (will be recalculated)
+        # Register position with fill price — recalculates SL/TP
         pos = Position(
             symbol=symbol,
             position_side=signal.direction.value,
@@ -397,40 +413,54 @@ class TradingEngine:
             take_profit=signal.take_profit,
             strategy_name=signal.strategy_name,
         )
-
-        # Register position with fill price — recalculates SL/TP
         pos = self._state.open_position_with_fill(pos, fill_price, requested_price)
 
-        # Place stop-loss order at recalculated SL
-        sl_side = "SELL" if signal.direction == SignalDirection.LONG else "BUY"
-        sl_order = Order(
+        # Place SL and TP brackets with recalculated prices
+        sl_result, tp_result = await self._order_mgr.place_brackets(
             symbol=symbol,
-            side=sl_side,
             position_side=signal.direction.value,
-            order_type="STOP_MARKET",
             quantity=filled_qty,
-            stop_price=pos.stop_loss,
-            reduce_only=True,
+            sl_price=pos.stop_loss,
+            tp_price=pos.take_profit,
         )
-        sl_result = await self._order_mgr.submit_order(sl_order)
         pos.sl_order_id = sl_result.get("orderId") if sl_result else None
+        pos.tp_order_id = tp_result.get("orderId") if tp_result else None
 
-        await self._event_bus.publish(Event(
-            type=EventType.POSITION_OPENED,
-            data={
-                "symbol": symbol,
-                "direction": signal.direction.value,
-                "requested_price": requested_price,
-                "fill_price": fill_price,
-                "slippage_bps": pos.slippage_bps,
-                "entry": fill_price,
-                "sl": pos.stop_loss,
-                "tp": pos.take_profit,
-                "qty": filled_qty,
-                "strategy": signal.strategy_name,
-                "risk_usdt": risk_usdt,
-            },
-        ))
+        if not sl_result or not tp_result:
+            logger.critical(
+                "Bracket order partially failed for %s: SL=%s TP=%s — cancelling brackets",
+                symbol,
+                sl_result is None,
+                tp_result is None,
+            )
+            if sl_result:
+                oid = sl_result.get("orderId")
+                if oid:
+                    await self._order_mgr.cancel_order(symbol, oid)
+            if tp_result:
+                oid = tp_result.get("orderId")
+                if oid:
+                    await self._order_mgr.cancel_order(symbol, oid)
+            return
+
+        await self._event_bus.publish(
+            Event(
+                type=EventType.POSITION_OPENED,
+                data={
+                    "symbol": symbol,
+                    "direction": signal.direction.value,
+                    "requested_price": requested_price,
+                    "fill_price": fill_price,
+                    "slippage_bps": pos.slippage_bps,
+                    "entry": fill_price,
+                    "sl": pos.stop_loss,
+                    "tp": pos.take_profit,
+                    "qty": filled_qty,
+                    "strategy": signal.strategy_name,
+                    "risk_usdt": risk_usdt,
+                },
+            )
+        )
 
     # ── Position management ───────────────────────────────────────────────────
 
@@ -447,13 +477,16 @@ class TradingEngine:
                 if self._risk_engine.check_time_stop(pos.open_hours):
                     logger.info(
                         "Time stop: closing %s %s after %.1fh",
-                        pos.symbol, pos.position_side, pos.open_hours,
+                        pos.symbol,
+                        pos.position_side,
+                        pos.open_hours,
                     )
                     await self._close_position(pos, current_price, "time_stop")
                     continue
 
                 # Trailing stop
                 from strategy.indicators import atr as calc_atr
+
                 atr_vals = calc_atr(df["high"], df["low"], df["close"], 14)
                 atr_val = float(atr_vals.iloc[-1])
 
@@ -486,15 +519,17 @@ class TradingEngine:
                 self._total_loss_usdt += abs(pnl)
 
             self._state.close_position(pos.symbol, pos.position_side)
-            await self._event_bus.publish(Event(
-                type=EventType.POSITION_CLOSED,
-                data={
-                    "symbol": pos.symbol,
-                    "direction": pos.position_side,
-                    "pnl": pnl,
-                    "reason": reason,
-                },
-            ))
+            await self._event_bus.publish(
+                Event(
+                    type=EventType.POSITION_CLOSED,
+                    data={
+                        "symbol": pos.symbol,
+                        "direction": pos.position_side,
+                        "pnl": pnl,
+                        "reason": reason,
+                    },
+                )
+            )
 
     # ── Background loops ──────────────────────────────────────────────────────
 
@@ -511,13 +546,17 @@ class TradingEngine:
                 # Publish circuit breaker event on level change
                 if level != _prev_cb_level:
                     _prev_cb_level = level
-                    await self._event_bus.publish(Event(
-                        EventType.CIRCUIT_BREAKER,
-                        {
-                            "level": level,
-                            "dd_pct": abs(self._dd_monitor.current_drawdown() * 100),
-                        },
-                    ))
+                    await self._event_bus.publish(
+                        Event(
+                            EventType.CIRCUIT_BREAKER,
+                            {
+                                "level": level,
+                                "dd_pct": abs(
+                                    self._dd_monitor.current_drawdown() * 100
+                                ),
+                            },
+                        )
+                    )
 
                 if self._dd_monitor.requires_emergency_close():
                     await self._emergency.trigger("Max drawdown exceeded")
@@ -564,7 +603,7 @@ class TradingEngine:
         """Handle incoming kline WebSocket message."""
         try:
             k = data.get("data", {}).get("k", {})
-            if not k.get("x", False):   # Not a closed candle
+            if not k.get("x", False):  # Not a closed candle
                 return
             symbol = data.get("data", {}).get("s", "")
             interval = k.get("i", "1H").upper()
@@ -598,7 +637,10 @@ class TradingEngine:
         new = event.data.get("new_level", "NONE")
         mult = event.data.get("size_multiplier", 1.0)
         logger.warning(
-            "Circuit breaker transition: %s → %s | size_multiplier=%.2f", prev, new, mult
+            "Circuit breaker transition: %s → %s | size_multiplier=%.2f",
+            prev,
+            new,
+            mult,
         )
 
     async def _on_emergency_stop(self, event: Event) -> None:
@@ -611,5 +653,5 @@ class TradingEngine:
     def _win_rate(self) -> float:
         total = self._win_count + self._loss_count
         if total == 0:
-            return 0.55   # Prior
+            return 0.55  # Prior
         return self._win_count / total

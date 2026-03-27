@@ -2,6 +2,7 @@
 Simple in-process async event bus using asyncio.Queue.
 Decouples producers (market data, WebSocket) from consumers (engine, monitoring).
 """
+
 import asyncio
 import logging
 from dataclasses import dataclass, field
@@ -19,6 +20,8 @@ class EventType(str, Enum):
     ORDER_CANCELLED = "order_cancelled"
     POSITION_OPENED = "position_opened"
     POSITION_CLOSED = "position_closed"
+    SL_HIT = "trade.sl_hit"
+    TP_HIT = "trade.tp_hit"
     CIRCUIT_BREAKER = "circuit_breaker"
     # H-4: published whenever the circuit breaker moves to a new level
     # (escalation AND recovery).  Payload keys:
@@ -70,7 +73,5 @@ class EventBus:
                     if asyncio.iscoroutine(result):
                         await result
                 except Exception as exc:
-                    logger.error(
-                        "Event handler error for %s: %s", event.type, exc
-                    )
+                    logger.error("Event handler error for %s: %s", event.type, exc)
             self._queue.task_done()
