@@ -307,25 +307,28 @@ class TestTrailingStop:
 # ── Risk engine TP validation ─────────────────────────────────────────────────
 
 class TestRiskEngineTPValidation:
-    def test_valid_long_signal_approved(self):
+    @pytest.mark.asyncio
+    async def test_valid_long_signal_approved(self):
         """Valid LONG with TP above entry and R:R ≥ 1.5 must pass."""
         re = make_risk_engine()
         signal = make_long_signal(entry=100.0, sl=97.0, tp=106.0)  # R:R = 2.0
 
-        approved, reason = re.approve_signal(signal=signal, **APPROVE_KWARGS)
+        approved, reason = await re.approve_signal(signal=signal, **APPROVE_KWARGS)
 
         assert approved, f"Expected approved but got: {reason}"
 
-    def test_valid_short_signal_approved(self):
+    @pytest.mark.asyncio
+    async def test_valid_short_signal_approved(self):
         """Valid SHORT with TP below entry and R:R ≥ 1.5 must pass."""
         re = make_risk_engine()
         signal = make_short_signal(entry=100.0, sl=103.0, tp=95.5)  # R:R = 1.5
 
-        approved, reason = re.approve_signal(signal=signal, **APPROVE_KWARGS)
+        approved, reason = await re.approve_signal(signal=signal, **APPROVE_KWARGS)
 
         assert approved, f"Expected approved but got: {reason}"
 
-    def test_long_tp_below_entry_rejected(self):
+    @pytest.mark.asyncio
+    async def test_long_tp_below_entry_rejected(self):
         """LONG signal where TP is below entry must be rejected."""
         re = make_risk_engine()
         signal = Signal(
@@ -339,12 +342,13 @@ class TestRiskEngineTPValidation:
             confidence=0.8,
         )
 
-        approved, reason = re.approve_signal(signal=signal, **APPROVE_KWARGS)
+        approved, reason = await re.approve_signal(signal=signal, **APPROVE_KWARGS)
 
         assert not approved
         assert "TP" in reason
 
-    def test_short_tp_above_entry_rejected(self):
+    @pytest.mark.asyncio
+    async def test_short_tp_above_entry_rejected(self):
         """SHORT signal where TP is above entry must be rejected."""
         re = make_risk_engine()
         signal = Signal(
@@ -358,12 +362,13 @@ class TestRiskEngineTPValidation:
             confidence=0.8,
         )
 
-        approved, reason = re.approve_signal(signal=signal, **APPROVE_KWARGS)
+        approved, reason = await re.approve_signal(signal=signal, **APPROVE_KWARGS)
 
         assert not approved
         assert "TP" in reason
 
-    def test_signal_missing_tp_rejected(self):
+    @pytest.mark.asyncio
+    async def test_signal_missing_tp_rejected(self):
         """Signal with take_profit=0 (effectively missing) must be rejected."""
         re = make_risk_engine()
         signal = Signal(
@@ -377,11 +382,12 @@ class TestRiskEngineTPValidation:
             confidence=0.8,
         )
 
-        approved, reason = re.approve_signal(signal=signal, **APPROVE_KWARGS)
+        approved, reason = await re.approve_signal(signal=signal, **APPROVE_KWARGS)
 
         assert not approved
 
-    def test_signal_low_rr_rejected(self):
+    @pytest.mark.asyncio
+    async def test_signal_low_rr_rejected(self):
         """Signal with R:R < 1.5 must be rejected."""
         re = make_risk_engine()
         signal = Signal(
@@ -395,7 +401,7 @@ class TestRiskEngineTPValidation:
             confidence=0.8,
         )
 
-        approved, reason = re.approve_signal(signal=signal, **APPROVE_KWARGS)
+        approved, reason = await re.approve_signal(signal=signal, **APPROVE_KWARGS)
 
         assert not approved
         assert "R:R" in reason or "ratio" in reason.lower()

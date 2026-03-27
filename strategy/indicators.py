@@ -2,6 +2,8 @@
 Pure-pandas technical indicator implementations (no TA-Lib dependency).
 All functions operate on a pd.Series or pd.DataFrame and return pd.Series.
 """
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
@@ -106,7 +108,7 @@ def donchian_channel(
 
 def vwap(
     high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series,
-    timestamps: pd.Series | None = None,
+    timestamps: Optional[pd.Series] = None,
 ) -> pd.Series:
     """
     Volume Weighted Average Price with daily reset.
