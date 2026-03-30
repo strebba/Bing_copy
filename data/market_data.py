@@ -1,6 +1,7 @@
 """
 Market data layer — fetches OHLCV from BingX, caches it, and computes indicators.
 """
+
 import asyncio
 import logging
 import time
@@ -15,9 +16,19 @@ logger = logging.getLogger(__name__)
 
 # BingX interval mapping
 INTERVAL_MAP = {
-    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-    "1H": "1h", "2H": "2h", "4H": "4h", "6H": "6h",
-    "8H": "8h", "12H": "12h", "1D": "1d", "3D": "3d", "1W": "1w",
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1H": "1h",
+    "2H": "2h",
+    "4H": "4h",
+    "6H": "6h",
+    "8H": "8h",
+    "12H": "12h",
+    "1D": "1d",
+    "3D": "3d",
+    "1W": "1w",
 }
 
 
@@ -64,17 +75,33 @@ class MarketDataManager:
         """Convert raw BingX klines list to DataFrame."""
         if not raw:
             return pd.DataFrame()
-        # BingX returns: [open_time, open, high, low, close, volume, close_time, ...]
+
         rows = []
         for k in raw:
-            rows.append({
-                "timestamp": int(k[0]),
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-            })
+            # Demo mode returns dict, production returns list
+            if isinstance(k, dict):
+                rows.append(
+                    {
+                        "timestamp": int(k.get("time", k.get("openTime", 0))),
+                        "open": float(k.get("open", 0)),
+                        "high": float(k.get("high", 0)),
+                        "low": float(k.get("low", 0)),
+                        "close": float(k.get("close", 0)),
+                        "volume": float(k.get("volume", 0)),
+                    }
+                )
+            else:
+                # Production format: [open_time, open, high, low, close, volume, ...]
+                rows.append(
+                    {
+                        "timestamp": int(k[0]),
+                        "open": float(k[1]),
+                        "high": float(k[2]),
+                        "low": float(k[3]),
+                        "close": float(k[4]),
+                        "volume": float(k[5]),
+                    }
+                )
         df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
         df.attrs["timeframe"] = timeframe
         return df
@@ -108,9 +135,11 @@ class MarketDataManager:
                 df.at[df.index[-1], col] = val
         else:
             # Append new candle and trim to max size
-            df = pd.concat(
-                [df, pd.DataFrame([new_row])], ignore_index=True
-            ).tail(self._max_candles).reset_index(drop=True)
+            df = (
+                pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                .tail(self._max_candles)
+                .reset_index(drop=True)
+            )
 
         df.attrs["timeframe"] = interval
         self._cache[symbol][interval] = df

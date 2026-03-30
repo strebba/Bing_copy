@@ -290,7 +290,12 @@ class BingXClient:
         if symbol:
             params["symbol"] = symbol
         resp = await self._get(settings.BINGX_ENDPOINTS["positions"], params)
-        return resp.get("data", {}).get("positions", [])
+        # Demo mode returns list directly, production wraps in data.positions
+        if isinstance(resp, list):
+            return resp
+        return (
+            resp.get("data", {}).get("positions", []) if isinstance(resp, dict) else []
+        )
 
     @with_retry()
     async def get_open_orders(self, symbol: str) -> List[Dict]:

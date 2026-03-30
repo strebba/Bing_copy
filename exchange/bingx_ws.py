@@ -112,7 +112,12 @@ class BingXWebSocket:
             if text == "Pong":
                 return
 
-            data = json.loads(text)
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                logger.debug("Non-JSON WS message (heartbeat?): %s", text[:50])
+                return
+
             data_type = data.get("dataType", "")
 
             for stream_id, callback in list(self._callbacks.items()):
