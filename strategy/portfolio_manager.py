@@ -6,6 +6,7 @@ up-to-date _cb_size_multiplier that is applied to every new signal's risk_pct.
 This replaces the previous polling approach (reading dd_monitor.current_drawdown()
 on every cycle) with an event-driven one so strategies react immediately.
 """
+
 import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -66,10 +67,10 @@ def classify_regime(df: pd.DataFrame) -> str:
 
 
 REGIME_WEIGHTS: Dict[str, Dict[str, float]] = {
-    MarketRegime.TRENDING:  {"alpha": 0.50, "beta": 0.15, "gamma": 0.35},
-    MarketRegime.RANGING:   {"alpha": 0.30, "beta": 0.50, "gamma": 0.20},
-    MarketRegime.HIGH_VOL:  {"alpha": 0.30, "beta": 0.20, "gamma": 0.30},  # +20% cash
-    MarketRegime.LOW_VOL:   {"alpha": 0.40, "beta": 0.30, "gamma": 0.30},
+    MarketRegime.TRENDING: {"alpha": 0.50, "beta": 0.15, "gamma": 0.35},
+    MarketRegime.RANGING: {"alpha": 0.30, "beta": 0.50, "gamma": 0.20},
+    MarketRegime.HIGH_VOL: {"alpha": 0.30, "beta": 0.20, "gamma": 0.30},  # +20% cash
+    MarketRegime.LOW_VOL: {"alpha": 0.40, "beta": 0.30, "gamma": 0.30},
 }
 
 
@@ -96,6 +97,7 @@ class PortfolioManager:
 
         if event_bus is not None:
             from core.event_bus import EventType  # noqa: PLC0415
+
             event_bus.subscribe(
                 EventType.CIRCUIT_BREAKER_LEVEL_CHANGE,
                 self._on_circuit_breaker_level_change,
@@ -130,11 +132,16 @@ class PortfolioManager:
         self,
         df_by_symbol: Dict[str, pd.DataFrame],
         funding_rates: Dict[str, float] = None,
-        oi_changes: Dict[str, float] = None,
+        oi_changes: Dict[
+            str, float
+        ] = None,  # Deprecated: OI not available from WebSocket
     ) -> List[Signal]:
         """
         Run all strategies on each symbol's OHLCV DataFrame.
         Returns aggregated list of valid signals, scaled by strategy weight.
+
+        Note: oi_changes parameter is deprecated as Open Interest data is not
+        available from the WebSocket market data stream.
         """
         if funding_rates is None:
             funding_rates = {}
@@ -159,7 +166,9 @@ class PortfolioManager:
             if sig and sig.is_valid():
                 sig.risk_pct *= weights.get("alpha", 0.4) * cb_mult
                 all_signals.append(sig)
-                logger.info("[Alpha] %s %s (conf=%.2f)", symbol, sig.direction, sig.confidence)
+                logger.info(
+                    "[Alpha] %s %s (conf=%.2f)", symbol, sig.direction, sig.confidence
+                )
 
             # Beta
             fr = funding_rates.get(symbol, 0.0)
@@ -167,15 +176,18 @@ class PortfolioManager:
             if sig and sig.is_valid():
                 sig.risk_pct *= weights.get("beta", 0.3) * cb_mult
                 all_signals.append(sig)
-                logger.info("[Beta] %s %s (conf=%.2f)", symbol, sig.direction, sig.confidence)
+                logger.info(
+                    "[Beta] %s %s (conf=%.2f)", symbol, sig.direction, sig.confidence
+                )
 
-            # Gamma
-            oi = oi_changes.get(symbol, 0.0)
-            sig = self._gamma.generate_signal(df, symbol, open_interest_change=oi)
+            # Gamma (OI data not available from WebSocket)
+            sig = self._gamma.generate_signal(df, symbol)
             if sig and sig.is_valid():
                 sig.risk_pct *= weights.get("gamma", 0.3) * cb_mult
                 all_signals.append(sig)
-                logger.info("[Gamma] %s %s (conf=%.2f)", symbol, sig.direction, sig.confidence)
+                logger.info(
+                    "[Gamma] %s %s (conf=%.2f)", symbol, sig.direction, sig.confidence
+                )
 
         return self._resolve_conflicts(all_signals)
 
@@ -217,18 +229,28 @@ class PortfolioManager:
                         "[Conflict] %s: LONG (conf=%.2f, %s) vs SHORT (conf=%.2f, %s) "
                         "— diff %.2f%% < 5%%, NO TRADE",
                         symbol,
-                        best_long.confidence, best_long.strategy_name,
-                        best_short.confidence, best_short.strategy_name,
+                        best_long.confidence,
+                        best_long.strategy_name,
+                        best_short.confidence,
+                        best_short.strategy_name,
                         diff * 100,
                     )
                 else:
-                    winner = best_long if best_long.confidence > best_short.confidence else best_short
+                    winner = (
+                        best_long
+                        if best_long.confidence > best_short.confidence
+                        else best_short
+                    )
                     loser = best_short if winner is best_long else best_long
                     logger.warning(
                         "[Conflict] %s: %s wins (conf=%.2f, %s) over %s (conf=%.2f, %s)",
                         symbol,
-                        winner.direction.value, winner.confidence, winner.strategy_name,
-                        loser.direction.value, loser.confidence, loser.strategy_name,
+                        winner.direction.value,
+                        winner.confidence,
+                        winner.strategy_name,
+                        loser.direction.value,
+                        loser.confidence,
+                        loser.strategy_name,
                     )
                     resolved.append(winner)
             elif longs:
@@ -237,7 +259,10 @@ class PortfolioManager:
                 if len(longs) > 1:
                     logger.info(
                         "[Agree] %s: %d LONG signals, keeping best (conf=%.2f, %s)",
-                        symbol, len(longs), best.confidence, best.strategy_name,
+                        symbol,
+                        len(longs),
+                        best.confidence,
+                        best.strategy_name,
                     )
                 resolved.append(best)
             elif shorts:
@@ -246,7 +271,10 @@ class PortfolioManager:
                 if len(shorts) > 1:
                     logger.info(
                         "[Agree] %s: %d SHORT signals, keeping best (conf=%.2f, %s)",
-                        symbol, len(shorts), best.confidence, best.strategy_name,
+                        symbol,
+                        len(shorts),
+                        best.confidence,
+                        best.strategy_name,
                     )
                 resolved.append(best)
 

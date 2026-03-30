@@ -1,7 +1,16 @@
 """
 Strategy Gamma — Breakout Volatility (30 % portfolio weight).
-Entry: Donchian breakout after BB squeeze + volume spike + OI increase.
+Entry: Donchian breakout after BB squeeze + volume spike.
+
+Note: Open Interest (OI) data is not currently available from the WebSocket
+market data stream. The OI condition has been removed from the breakout
+criteria to prevent false signals. The strategy now relies on:
+- BB squeeze detection (BBW < 20th percentile for 10+ periods)
+- Donchian Channel breakout
+- Volume spike (> 2x 20-period average)
+- ATR percentile filter
 """
+
 import logging
 from typing import Optional
 
@@ -25,7 +34,6 @@ class GammaBreakoutStrategy(BaseStrategy):
         self,
         df: pd.DataFrame,
         symbol: str,
-        open_interest_change: float = 0.0,  # Fractional change in OI
     ) -> Optional[Signal]:
         if not self._validate_df(df):
             return None
@@ -57,9 +65,7 @@ class GammaBreakoutStrategy(BaseStrategy):
 
         # Consecutive squeeze bars
         squeeze_active = bbw < bbw_tail.quantile(0.20)
-        consecutive_squeeze = int(
-            squeeze_active.iloc[-p.squeeze_periods_min:].all()
-        )
+        consecutive_squeeze = int(squeeze_active.iloc[-p.squeeze_periods_min :].all())
 
         last_close = close.iloc[-1]
         prev_close = close.iloc[-2]
@@ -75,13 +81,12 @@ class GammaBreakoutStrategy(BaseStrategy):
 
         # ── Breakout conditions ───────────────────────────────────────────────
         volume_spike = last_vol > p.volume_spike_mult * last_avg_vol
-        oi_expanding = open_interest_change > 0
         squeeze_resolved = consecutive_squeeze or bbw_pct_rank < 25
 
         # LONG breakout: close above Donchian upper
         bull_breakout = (
             last_close > last_dc_upper
-            and prev_close <= dc_upper.iloc[-2]          # Fresh breakout
+            and prev_close <= dc_upper.iloc[-2]  # Fresh breakout
             and volume_spike
             and squeeze_resolved
         )
@@ -94,17 +99,18 @@ class GammaBreakoutStrategy(BaseStrategy):
             and squeeze_resolved
         )
 
-        conf_score = sum([volume_spike, oi_expanding, squeeze_resolved]) / 3
+        conf_score = (int(volume_spike) + int(squeeze_resolved)) / 2
 
         if bull_breakout:
-            sl = last_dc_mid   # Center of the compression range
+            sl = last_dc_mid  # Center of the compression range
             return Signal(
                 direction=SignalDirection.LONG,
                 symbol=symbol,
                 strategy_name=self.name,
                 entry_price=last_close,
                 stop_loss=sl,
-                take_profit=last_close + 2 * last_atr,   # Initial TP; trailing takes over
+                take_profit=last_close
+                + 2 * last_atr,  # Initial TP; trailing takes over
                 risk_pct=p.risk_pct,
                 confidence=conf_score,
                 timeframe=df.attrs.get("timeframe", "1H"),

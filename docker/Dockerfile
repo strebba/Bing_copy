@@ -24,9 +24,9 @@ RUN mkdir -p logs
 RUN useradd -m -u 1000 wagmi && chown -R wagmi:wagmi /app
 USER wagmi
 
-# Health check
+# Health check - verify core modules can be imported (no external API calls)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import aiohttp, asyncio; asyncio.run(aiohttp.ClientSession().get('https://open-api-vst.bingx.com/openApi/swap/v2/quote/ticker?symbol=BTC-USDT'))" \
+    CMD python -c "from core.event_bus import EventBus; from core.finance import to_decimal; print('OK')" \
     || exit 1
 
 # Entry point

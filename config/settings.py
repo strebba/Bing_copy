@@ -66,7 +66,9 @@ DD_EMERGENCY_PCT = 0.20  # 20 % → close all
 MAX_OPEN_RISK_PCT = 0.05  # 5 % total open risk
 MAX_CORR_NEW_POSITION = 0.6  # Correlation guard
 MIN_LIQUIDITY_24H_USD = 10_000_000  # $10 M
-MAX_SPREAD_PCT = 0.0005  # 0.05 %
+# MAX_SPREAD_PCT: Maximum allowed spread as decimal (0.0005 = 0.05% = 0.5‰)
+# For 0.5% use 0.005, for 0.05% use 0.0005, for 0.05‰ use 0.00005
+MAX_SPREAD_PCT = 0.0005  # 0.05 % (5 basis points)
 
 # ── Copy Trading ──────────────────────────────────────────────────────────────
 PROFIT_SHARING_RATE = float(os.getenv("PROFIT_SHARING_RATE", "0.10"))  # 10 %

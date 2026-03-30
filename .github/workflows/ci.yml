@@ -66,9 +66,8 @@ jobs:
       - name: Ruff lint
         run: ruff check . --select E,W,F --ignore E501
 
-      - name: Type check (non-blocking)
-        run: mypy --ignore-missing-imports strategy/ risk/ analytics/
-        continue-on-error: true
+      - name: Type check (blocking)
+        run: mypy --ignore-missing-imports strategy/ risk/ analytics/ core/ exchange/
 
   docker:
     name: Docker Build

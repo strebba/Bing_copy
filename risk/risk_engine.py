@@ -2,6 +2,7 @@
 Core risk engine — pre-trade checks, in-trade management, portfolio controls.
 Includes daily reset logic (H-8).
 """
+
 import logging
 import time
 from datetime import datetime, timezone
@@ -17,7 +18,8 @@ logger = logging.getLogger(__name__)
 
 # How long (seconds) to trust the locally-cached position count before
 # hitting the exchange again for reconciliation.
-_POSITION_CACHE_TTL = 5.0
+# 15s provides better balance between freshness and API rate limits.
+_POSITION_CACHE_TTL = 15.0
 
 
 class RiskEngine:
@@ -65,7 +67,9 @@ class RiskEngine:
         if today != self._current_trading_day:
             logger.info(
                 "Daily reset: %s → %s (previous day PnL: %.2f)",
-                self._current_trading_day, today, self._daily_pnl,
+                self._current_trading_day,
+                today,
+                self._daily_pnl,
             )
             self._previous_day_pnl = self._daily_pnl
             self._daily_pnl = 0.0
@@ -77,16 +81,19 @@ class RiskEngine:
             # Publish event for other modules (e.g., PerformanceTracker)
             if self._event_bus is not None:
                 from core.event_bus import Event, EventType
+
                 try:
-                    self._event_bus.publish_nowait(Event(
-                        type=EventType.HEARTBEAT,  # Re-use existing type for sync pub
-                        data={
-                            "_daily_reset": True,
-                            "date": today.isoformat(),
-                            "previous_date": old_day.isoformat(),
-                            "previous_day_pnl": self._previous_day_pnl,
-                        },
-                    ))
+                    self._event_bus.publish_nowait(
+                        Event(
+                            type=EventType.HEARTBEAT,  # Re-use existing type for sync pub
+                            data={
+                                "_daily_reset": True,
+                                "date": today.isoformat(),
+                                "previous_date": old_day.isoformat(),
+                                "previous_day_pnl": self._previous_day_pnl,
+                            },
+                        )
+                    )
                 except Exception as exc:
                     logger.warning("Failed to publish daily reset event: %s", exc)
 
@@ -270,7 +277,10 @@ class RiskEngine:
         # Open risk cap
         max_open_risk = equity * settings.MAX_OPEN_RISK_PCT
         if existing_positions_risk_usdt >= max_open_risk:
-            return False, f"Max open risk exceeded ({existing_positions_risk_usdt:.0f} USDT)"
+            return (
+                False,
+                f"Max open risk exceeded ({existing_positions_risk_usdt:.0f} USDT)",
+            )
 
         # TP must exist and be on the correct side of entry
         if signal.take_profit <= 0:
@@ -339,7 +349,7 @@ class RiskEngine:
         Trailing activates after 1:1 R:R is reached.
         """
         if position_side == "LONG":
-            rr_target = entry_price + atr_value   # 1:1 level
+            rr_target = entry_price + atr_value  # 1:1 level
             if current_price >= rr_target and partial_profit_taken:
                 return current_price - atr_mult * atr_value
         else:
