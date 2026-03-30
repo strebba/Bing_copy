@@ -232,13 +232,15 @@ class BingXClient:
         self, endpoint: str, params: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         await self._ensure_session()
-        p = self._build_params(params or {})
+        p = self._build_params(params.copy() if params else {})
         headers = {
             "X-BX-APIKEY": self._api_key,
             "Content-Type": "application/x-www-form-urlencoded",
         }
         url = self._base_url + endpoint
-        async with self._session.post(url, data=p, headers=headers) as resp:
+        # Build form-encoded body string
+        body = urlencode(sorted(p.items()))
+        async with self._session.post(url, data=body, headers=headers) as resp:
             data = await resp.json()
             self._raise_if_error(data)
             return data
@@ -410,9 +412,10 @@ class BingXClient:
     @with_retry()
     async def create_listen_key(self) -> str:
         resp = await self._post(settings.BINGX_ENDPOINTS["user_data_stream"])
-        listen_key = resp.get("data", {}).get("listenKey", "")
+        # Demo mode returns listenKey directly, production wraps in data
+        listen_key = resp.get("data", {}).get("listenKey") or resp.get("listenKey", "")
         if not listen_key:
-            raise RuntimeError("Failed to create listen key")
+            raise RuntimeError(f"Failed to create listen key: {resp}")
         return listen_key
 
     @with_retry()
