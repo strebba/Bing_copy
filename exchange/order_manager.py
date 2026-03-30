@@ -26,6 +26,7 @@ from core.finance import (
     round_quantity,
     to_decimal,
 )
+from config import settings
 from exchange.bingx_client import BingXClient
 from exchange.rate_limiter import ORDER_LIMITER, REQUEST_LIMITER
 
@@ -300,13 +301,18 @@ class OrderManager:
         """Close a position via market order."""
         close_side = "SELL" if position_side == "LONG" else "BUY"
         qty = to_decimal(quantity)
+
+        # Determine reduceOnly based on trading mode
+        is_hedge = settings.TRADING_MODE == "hedge"
+        reduce_only = not is_hedge
+
         order = Order(
             symbol=symbol,
             side=close_side,
             position_side=position_side,
             order_type="MARKET",
             quantity=qty,
-            reduce_only=True,
+            reduce_only=reduce_only,
         )
         return await self.submit_order(order)
 
@@ -324,12 +330,8 @@ class OrderManager:
         Place a market entry order followed immediately by SL (STOP_MARKET) and
         TP (TAKE_PROFIT_MARKET) bracket orders on BingX.
 
-        Both bracket orders are reduceOnly so they cannot open new positions.
-        The BracketIds are stored internally; call on_sl_triggered /
-        on_tp_triggered when a fill notification arrives to cancel the other leg.
-
-        All price and quantity values are converted to Decimal internally
-        and rounded to exchange-preferred precision before submission.
+        In One-Way mode: bracket orders use reduceOnly=True to close positions.
+        In Hedge mode: bracket orders use positionSide to identify the position.
 
         Returns a dict with keys: entry_result, sl_result, tp_result.
         """
@@ -340,6 +342,11 @@ class OrderManager:
 
         entry_side = "BUY" if position_side == "LONG" else "SELL"
         close_side = "SELL" if position_side == "LONG" else "BUY"
+
+        # Determine reduceOnly based on trading mode
+        # Hedge mode doesn't support reduceOnly, uses positionSide instead
+        is_hedge = settings.TRADING_MODE == "hedge"
+        reduce_only = not is_hedge
 
         # 1. Market entry
         entry_order = Order(
@@ -358,7 +365,7 @@ class OrderManager:
             )
             return {"entry_result": None, "sl_result": None, "tp_result": None}
 
-        # 2. Stop Loss (STOP_MARKET, reduce-only)
+        # 2. Stop Loss (STOP_MARKET)
         sl_order = Order(
             symbol=symbol,
             side=close_side,
@@ -366,11 +373,11 @@ class OrderManager:
             order_type="STOP_MARKET",
             quantity=qty,
             stop_price=sl,
-            reduce_only=True,
+            reduce_only=reduce_only,
         )
         sl_result = await self.submit_order(sl_order)
 
-        # 3. Take Profit (TAKE_PROFIT_MARKET, reduce-only)
+        # 3. Take Profit (TAKE_PROFIT_MARKET)
         tp_order = Order(
             symbol=symbol,
             side=close_side,
@@ -378,7 +385,7 @@ class OrderManager:
             order_type="TAKE_PROFIT_MARKET",
             quantity=qty,
             stop_price=tp,
-            reduce_only=True,
+            reduce_only=reduce_only,
         )
         tp_result = await self.submit_order(tp_order)
 
@@ -416,7 +423,8 @@ class OrderManager:
         Place SL and TP bracket orders for an already-open position.
         Used after fill price is known and SL/TP have been recalculated.
 
-        All inputs converted to Decimal and rounded to exchange precision.
+        In One-Way mode: bracket orders use reduceOnly=True
+        In Hedge mode: bracket orders use positionSide (reduceOnly=False)
 
         Returns (sl_result, tp_result).
         """
@@ -427,6 +435,10 @@ class OrderManager:
 
         close_side = "SELL" if position_side == "LONG" else "BUY"
 
+        # Determine reduceOnly based on trading mode
+        is_hedge = settings.TRADING_MODE == "hedge"
+        reduce_only = not is_hedge
+
         sl_order = Order(
             symbol=symbol,
             side=close_side,
@@ -434,7 +446,7 @@ class OrderManager:
             order_type="STOP_MARKET",
             quantity=qty,
             stop_price=sl,
-            reduce_only=True,
+            reduce_only=reduce_only,
         )
         sl_result = await self.submit_order(sl_order)
 
@@ -445,7 +457,7 @@ class OrderManager:
             order_type="TAKE_PROFIT_MARKET",
             quantity=qty,
             stop_price=tp,
-            reduce_only=True,
+            reduce_only=reduce_only,
         )
         tp_result = await self.submit_order(tp_order)
 

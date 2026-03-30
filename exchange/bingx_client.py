@@ -371,8 +371,12 @@ class BingXClient:
             "positionSide": position_side,
             "type": order_type,
             "quantity": quantity,
-            "reduceOnly": str(reduce_only).upper(),
         }
+        # Only include reduceOnly in One-Way mode
+        # In Hedge mode, BingX doesn't accept reduceOnly field at all
+        if reduce_only:
+            params["reduceOnly"] = "TRUE"
+
         if price is not None:
             params["price"] = price
         if stop_price is not None:

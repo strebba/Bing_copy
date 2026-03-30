@@ -14,6 +14,11 @@ BINGX_API_KEY = os.getenv("BINGX_API_KEY", "")
 BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 
+# Trading mode: "hedge" or "one_way"
+# Hedge: Can hold both LONG and SHORT positions simultaneously
+# One-Way: Can only hold one direction at a time
+TRADING_MODE = os.getenv("TRADING_MODE", "hedge")
+
 BINGX_BASE_URL = (
     "https://open-api-vst.bingx.com" if DEMO_MODE else "https://open-api.bingx.com"
 )
