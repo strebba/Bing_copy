@@ -97,3 +97,63 @@ class TestTradingEngine:
         engine._win_count = 10
         engine._loss_count = 0
         assert engine._win_rate() == 1.0
+
+    @pytest.mark.asyncio
+    async def test_graceful_shutdown_closes_positions(self, engine):
+        """Test shutdown chiude posizioni aperte."""
+        engine._running = True
+
+        mock_position = {
+            "symbol": "BTC-USDT",
+            "positionSide": "LONG",
+            "positionAmt": "0.1",
+        }
+
+        with patch.object(engine, "_alerter") as alerter:
+            alerter.send = AsyncMock()
+            alerter.close = AsyncMock()
+            with patch.object(engine, "_client") as client:
+                client.get_positions = AsyncMock(return_value=[mock_position])
+                client.close = AsyncMock()
+                with patch.object(engine, "_emergency") as emerg:
+                    emerg.close_all_positions = AsyncMock()
+                    emerg.reason = "test"
+                    with patch.object(engine, "_ws") as ws:
+                        ws.stop = AsyncMock()
+                        with patch.object(engine, "_user_stream") as us:
+                            us.stop = AsyncMock()
+                            with patch.object(engine, "_funding") as funding:
+                                funding.stop = AsyncMock()
+                                await engine._graceful_shutdown()
+
+                                # Verifica che close_all_positions sia chiamato
+                                emerg.close_all_positions.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_engine_shutdown_sequence(self, engine):
+        """Test sequenza di shutdown."""
+        engine._running = True
+
+        with patch.object(engine, "_graceful_shutdown") as mock_shutdown:
+            await engine.stop()
+            assert engine._running is False
+
+    @pytest.mark.asyncio
+    async def test_supervised_gather_handles_critical_task_crash(self, engine):
+        """Test che crash task critici triggera emergency stop."""
+
+        async def crash_task():
+            raise Exception("Critical task crashed")
+
+        with patch.object(engine, "_emergency") as emerg:
+            emerg.trigger = AsyncMock()
+            with patch.object(engine, "_event_bus") as bus:
+                bus.publish = AsyncMock()
+
+                try:
+                    await engine._supervised_gather(crash_task(), names=["market_data"])
+                except Exception:
+                    pass
+
+                # Il task critico dovrebbe triggerare emergency stop
+                emerg.trigger.assert_called_once()

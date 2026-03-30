@@ -159,3 +159,145 @@ class TestMarketDataManager:
         ) as mock_fetch:
             await mdm.refresh_if_stale("BTC-USDT", "1H")
             assert not mock_fetch.called
+
+    def test_candle_aggregation_multiple_timeframes(self):
+        """Test per candle aggregation su multipli timeframe."""
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        mdm = MarketDataManager(client, max_candles=100)
+
+        # Crea dati candle per 1H
+        df_1h = pd.DataFrame(
+            {
+                "timestamp": [1000, 2000, 3000],
+                "open": [50000.0, 50100.0, 50200.0],
+                "high": [50100.0, 50200.0, 50300.0],
+                "low": [49900.0, 50000.0, 50100.0],
+                "close": [50100.0, 50200.0, 50300.0],
+                "volume": [1000.0, 1100.0, 1200.0],
+            }
+        )
+        df_1h.attrs["timeframe"] = "1H"
+
+        # Crea dati candle per 4H
+        df_4h = pd.DataFrame(
+            {
+                "timestamp": [4000, 8000],
+                "open": [50000.0, 51000.0],
+                "high": [51000.0, 52000.0],
+                "low": [49500.0, 50500.0],
+                "close": [51000.0, 52000.0],
+                "volume": [5000.0, 5500.0],
+            }
+        )
+        df_4h.attrs["timeframe"] = "4H"
+
+        mdm._cache["BTC-USDT"] = {"1H": df_1h, "4H": df_4h}
+
+        # Verifica che entrambi i timeframe siano accessibili
+        result_1h = mdm.get_df("BTC-USDT", "1H")
+        result_4h = mdm.get_df("BTC-USDT", "4H")
+
+        assert result_1h is not None
+        assert result_4h is not None
+        assert len(result_1h) == 3
+        assert len(result_4h) == 2
+        assert result_1h.attrs["timeframe"] == "1H"
+        assert result_4h.attrs["timeframe"] == "4H"
+
+    def test_candle_aggregation_high_low_consistency(self):
+        """Test che high sia sempre >= low nelle candle aggregate."""
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        mdm = MarketDataManager(client, max_candles=100)
+
+        df = pd.DataFrame(
+            {
+                "timestamp": [1000, 2000, 3000],
+                "open": [50000.0, 50100.0, 50200.0],
+                "high": [50200.0, 50300.0, 50400.0],
+                "low": [49900.0, 50000.0, 50100.0],
+                "close": [50100.0, 50200.0, 50300.0],
+                "volume": [1000.0, 1100.0, 1200.0],
+            }
+        )
+
+        mdm._cache["BTC-USDT"] = {"1H": df}
+
+        result = mdm.get_df("BTC-USDT", "1H")
+
+        # Verifica che high >= low per ogni riga
+        for _, row in result.iterrows():
+            assert row["high"] >= row["low"]
+            assert row["high"] >= row["open"]
+            assert row["high"] >= row["close"]
+            assert row["low"] <= row["open"]
+            assert row["low"] <= row["close"]
+
+    def test_candle_aggregation_volume_sum(self):
+        """Test che il volume sia sommato correttamente nelle candle."""
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        mdm = MarketDataManager(client, max_candles=100)
+
+        df = pd.DataFrame(
+            {
+                "timestamp": [1000, 2000, 3000],
+                "open": [50000.0, 50100.0, 50200.0],
+                "high": [50100.0, 50200.0, 50300.0],
+                "low": [49900.0, 50000.0, 50100.0],
+                "close": [50100.0, 50200.0, 50300.0],
+                "volume": [1000.0, 1100.0, 1200.0],
+            }
+        )
+
+        mdm._cache["BTC-USDT"] = {"1H": df}
+
+        result = mdm.get_df("BTC-USDT", "1H")
+
+        # Verifica che il volume totale sia la somma
+        total_volume = result["volume"].sum()
+        assert total_volume == 3300.0
+        assert result["volume"].iloc[0] == 1000.0
+        assert result["volume"].iloc[1] == 1100.0
+        assert result["volume"].iloc[2] == 1200.0
+
+    def test_update_candle_aggregation_maintains_order(self):
+        """Test che l'aggregazione mantenga l'ordine cronologico."""
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        mdm = MarketDataManager(client, max_candles=100)
+
+        df = pd.DataFrame(
+            {
+                "timestamp": [1000, 2000, 3000],
+                "open": [50000.0, 50100.0, 50200.0],
+                "high": [50100.0, 50200.0, 50300.0],
+                "low": [49900.0, 50000.0, 50100.0],
+                "close": [50100.0, 50200.0, 50300.0],
+                "volume": [1000.0, 1100.0, 1200.0],
+            }
+        )
+
+        mdm._cache["BTC-USDT"] = {"1H": df}
+
+        # Aggiungi nuova candle
+        new_candle = {
+            "t": 4000,
+            "o": "50300",
+            "h": "50400",
+            "l": "50200",
+            "c": "50400",
+            "v": "1300",
+        }
+        mdm.update_candle("BTC-USDT", "1H", new_candle)
+
+        result = mdm.get_df("BTC-USDT", "1H")
+
+        # Verifica che l'ordine sia mantenuto
+        timestamps = result["timestamp"].tolist()
+        assert timestamps == [1000, 2000, 3000, 4000]

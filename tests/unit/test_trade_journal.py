@@ -161,3 +161,127 @@ class TestTradeJournal:
         assert len(df_csv) == 2
         assert "symbol" in df_csv.columns
         assert "pnl_usdt" in df_csv.columns
+
+    def test_trade_open_entry_registered_with_all_fields(self):
+        """Trade aperto → entry registrata con tutti i campi."""
+        signal = MockSignal()
+        self.journal.log_signal(signal)
+
+        with open(self.journal_path) as f:
+            lines = f.readlines()
+
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["event"] == "SIGNAL"
+        assert record["symbol"] == "BTC-USDT"
+        assert record["direction"] == "LONG"
+        assert record["strategy"] == "alpha"
+        assert record["confidence"] == 0.85
+        assert record["entry"] == 50000.0
+        assert record["sl"] == 49000.0
+        assert record["tp"] == 52000.0
+        assert record["rr"] == 2.0
+        assert "ts" in record
+
+    def test_trade_closed_updates_entry_with_pnl_slippage_duration(self):
+        """Trade chiuso → entry aggiornata con PnL, slippage, durata."""
+        # Simula un trade aperto
+        self.journal.log_signal(MockSignal())
+
+        # Chiude il trade con PnL e slippage
+        self.journal.log_trade_closed(
+            symbol="BTC-USDT",
+            direction="LONG",
+            entry=50000.0,
+            exit_price=51000.0,
+            pnl=100.0,
+            reason="take_profit",
+            requested_price=51000.0,
+            fill_price=50995.0,
+            slippage_bps=1.0,
+        )
+
+        with open(self.journal_path) as f:
+            lines = f.readlines()
+
+        # Verifica l'ultima entry (TRADE_CLOSED)
+        closed_record = json.loads(lines[-1])
+        assert closed_record["event"] == "TRADE_CLOSED"
+        assert closed_record["pnl_usdt"] == 100.0
+        assert closed_record["entry"] == 50000.0
+        assert closed_record["exit"] == 51000.0
+        assert closed_record["reason"] == "take_profit"
+        assert closed_record["requested_price"] == 51000.0
+        assert closed_record["fill_price"] == 50995.0
+        assert closed_record["slippage_bps"] == 1.0
+
+    def test_csv_export_with_pnl_and_slippage_data(self):
+        """Export dei trade in formato CSV funzionante con PnL e slippage."""
+        # Trade con PnL positivo e slippage
+        self.journal.log_trade_closed(
+            symbol="BTC-USDT",
+            direction="LONG",
+            entry=50000.0,
+            exit_price=52000.0,
+            pnl=200.0,
+            reason="take_profit",
+            requested_price=52000.0,
+            fill_price=51990.0,
+            slippage_bps=1.92,
+        )
+
+        # Trade con perdita
+        self.journal.log_trade_closed(
+            symbol="ETH-USDT",
+            direction="SHORT",
+            entry=3000.0,
+            exit_price=3100.0,
+            pnl=-100.0,
+            reason="stop_loss",
+            requested_price=3100.0,
+            fill_price=3105.0,
+            slippage_bps=1.61,
+        )
+
+        csv_path = os.path.join(self.temp_dir, "trades_export.csv")
+        df = pd.read_json(self.journal_path, lines=True)
+        df.to_csv(csv_path, index=False)
+
+        assert os.path.exists(csv_path)
+        df_csv = pd.read_csv(csv_path)
+        assert len(df_csv) == 2
+
+        # Verifica colonne PnL
+        assert "pnl_usdt" in df_csv.columns
+        pnl_values = df_csv["pnl_usdt"].tolist()
+        assert 200.0 in pnl_values
+        assert -100.0 in pnl_values
+
+        # Verifica colonne slippage
+        assert "slippage_bps" in df_csv.columns
+        slippage_values = df_csv["slippage_bps"].tolist()
+        assert 1.92 in slippage_values
+        assert 1.61 in slippage_values
+
+    def test_multiple_trades_logged_sequentially(self):
+        """Test che più trade vengano loggati in sequenza nel file."""
+        # Trade 1
+        signal1 = MockSignal()
+        self.journal.log_signal(signal1)
+
+        # Trade 2
+        signal2 = MockSignal()
+        signal2.symbol = "ETH-USDT"
+        signal2.direction.value = "SHORT"
+        self.journal.log_signal(signal2)
+
+        with open(self.journal_path) as f:
+            lines = f.readlines()
+
+        assert len(lines) == 2
+
+        record1 = json.loads(lines[0])
+        record2 = json.loads(lines[1])
+
+        assert record1["symbol"] == "BTC-USDT"
+        assert record2["symbol"] == "ETH-USDT"

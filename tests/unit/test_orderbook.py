@@ -1,5 +1,7 @@
 """Unit tests for data/orderbook module."""
 
+import pytest
+
 from data.orderbook import OrderBookProcessor
 
 
@@ -109,3 +111,85 @@ class TestOrderBookProcessor:
         assert asks[0][0] == 50000.0
         assert asks[1][0] == 50001.0
         assert asks[2][0] == 50002.0
+
+    def test_spread_calculation_bid_ask_difference(self):
+        """Test base per spread calculation: differenza tra ask e bid."""
+        data = {
+            "bids": [["50000.0", "1.0"]],
+            "asks": [["50010.0", "1.0"]],
+        }
+        self.obp.update("BTC-USDT", data)
+
+        spread_pct = self.obp.spread_pct("BTC-USDT")
+        expected_spread = (50010.0 - 50000.0) / 50000.0
+        assert spread_pct == pytest.approx(expected_spread, rel=1e-10)
+        assert spread_pct == 0.0002  # 0.02%
+
+    def test_spread_with_tight_spread(self):
+        """Test spread con spread molto stretto."""
+        data = {
+            "bids": [["50000.0", "1.0"]],
+            "asks": [["50000.5", "1.0"]],
+        }
+        self.obp.update("BTC-USDT", data)
+
+        spread_pct = self.obp.spread_pct("BTC-USDT")
+        expected = (50000.5 - 50000.0) / 50000.0
+        assert spread_pct == pytest.approx(expected, rel=1e-10)
+
+    def test_spread_with_wide_spread(self):
+        """Test spread con spread molto ampio."""
+        data = {
+            "bids": [["50000.0", "1.0"]],
+            "asks": [["50100.0", "1.0"]],
+        }
+        self.obp.update("BTC-USDT", data)
+
+        spread_pct = self.obp.spread_pct("BTC-USDT")
+        expected = (50100.0 - 50000.0) / 50000.0
+        assert spread_pct == pytest.approx(expected, rel=1e-10)
+        assert spread_pct == 0.002  # 0.2%
+
+    def test_spread_updates_with_new_orderbook_data(self):
+        """Test che lo spread si aggiorna con nuovi dati orderbook."""
+        # Primo aggiornamento
+        data1 = {
+            "bids": [["50000.0", "1.0"]],
+            "asks": [["50010.0", "1.0"]],
+        }
+        self.obp.update("BTC-USDT", data1)
+        spread1 = self.obp.spread_pct("BTC-USDT")
+
+        # Secondo aggiornamento con prezzi diversi
+        data2 = {
+            "bids": [["50100.0", "1.0"]],
+            "asks": [["50120.0", "1.0"]],
+        }
+        self.obp.update("BTC-USDT", data2)
+        spread2 = self.obp.spread_pct("BTC-USDT")
+
+        # Verifica che lo spread sia cambiato
+        assert spread1 != spread2
+        expected_spread2 = (50120.0 - 50100.0) / 50100.0
+        assert spread2 == pytest.approx(expected_spread2, rel=1e-10)
+
+    def test_spread_calculation_with_multiple_levels(self):
+        """Test spread considera solo i migliori livelli."""
+        data = {
+            "bids": [
+                ["50000.0", "1.0"],  # Miglior bid
+                ["49999.0", "2.0"],
+                ["49998.0", "3.0"],
+            ],
+            "asks": [
+                ["50010.0", "1.0"],  # Miglior ask
+                ["50011.0", "2.0"],
+                ["50012.0", "3.0"],
+            ],
+        }
+        self.obp.update("BTC-USDT", data)
+
+        spread_pct = self.obp.spread_pct("BTC-USDT")
+        # Dovrebbe usare solo i migliori livelli
+        expected = (50010.0 - 50000.0) / 50000.0
+        assert spread_pct == pytest.approx(expected, rel=1e-10)

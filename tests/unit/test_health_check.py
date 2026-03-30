@@ -94,3 +94,65 @@ class TestHealthChecker:
             except asyncio.TimeoutError:
                 pass
             assert mock_logger.debug.called or mock_logger.critical.called
+
+    @pytest.mark.asyncio
+    async def test_health_loop_logs_critical_on_connectivity_failure(self):
+        """Test che l'alert 'connectivity lost' viene loggato quando API non risponde."""
+        self.health._running = True
+        self.mock_client.get_ticker = AsyncMock(
+            side_effect=Exception("Connection timeout")
+        )
+
+        with patch("monitoring.health_check.logger") as mock_logger:
+            task = asyncio.create_task(self.health.run_health_loop(interval_s=0))
+            await asyncio.sleep(0.05)
+            self.health._running = False
+            try:
+                await asyncio.wait_for(task, timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+            assert mock_logger.critical.called
+            # Verifica che il log contenga False per connected
+            assert any(
+                "False" in str(call) for call in mock_logger.critical.call_args_list
+            )
+
+    @pytest.mark.asyncio
+    async def test_health_loop_logs_critical_on_stale_heartbeat(self):
+        """Test che l'alert viene loggato quando heartbeat è stale."""
+        self.health._running = True
+        self.health._last_heartbeat = time.time() - MAX_HEARTBEAT_GAP_S - 1
+        self.mock_client.get_ticker = AsyncMock(return_value={"quoteVolume": 1000})
+
+        with patch("monitoring.health_check.logger") as mock_logger:
+            task = asyncio.create_task(self.health.run_health_loop(interval_s=0))
+            await asyncio.sleep(0.05)
+            self.health._running = False
+            try:
+                await asyncio.wait_for(task, timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+            assert mock_logger.critical.called
+            # Verifica che il log contenga False per heartbeat
+            assert any(
+                "False" in str(call) for call in mock_logger.critical.call_args_list
+            )
+
+    @pytest.mark.asyncio
+    async def test_ws_disconnect_alert_triggered(self):
+        """Test che WebSocket disconnesso triggera alert con reconnect."""
+        self.health._running = True
+        self.health._last_ws_message = time.time() - MAX_HEARTBEAT_GAP_S - 1
+        self.health._last_heartbeat = time.time()
+        self.mock_client.get_ticker = AsyncMock(return_value={"quoteVolume": 1000})
+
+        with patch("monitoring.health_check.logger") as mock_logger:
+            task = asyncio.create_task(self.health.run_health_loop(interval_s=0))
+            await asyncio.sleep(0.05)
+            self.health._running = False
+            try:
+                await asyncio.wait_for(task, timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+            status = self.health.status()
+            assert status["ws_ok"] is False
