@@ -189,7 +189,10 @@ class BingXClient:
     # ── Signing ───────────────────────────────────────────────────────────────
 
     def _sign(self, params: Dict[str, Any]) -> str:
-        query = urlencode(sorted(params.items()))
+        """Generate HMAC-SHA256 signature for the given params."""
+        # Filter out signature and sort params
+        filtered = {k: v for k, v in params.items() if k != "signature"}
+        query = urlencode(sorted(filtered.items()))
         return hmac.new(
             self._api_secret.encode("utf-8"),
             query.encode("utf-8"),
@@ -197,7 +200,10 @@ class BingXClient:
         ).hexdigest()
 
     def _build_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Add timestamp and signature to params."""
+        # Add timestamp FIRST
         params["timestamp"] = int(time.time() * 1000)
+        # Calculate signature from params BEFORE adding signature field
         params["signature"] = self._sign(params)
         return params
 
@@ -207,9 +213,14 @@ class BingXClient:
         self, endpoint: str, params: Optional[Dict[str, Any]] = None, sign: bool = True
     ) -> Dict[str, Any]:
         await self._ensure_session()
-        p = params or {}
+        p = params.copy() if params else {}
         if sign:
-            p = self._build_params(p)
+            # Generate timestamp as close to request as possible
+            p["timestamp"] = int(time.time() * 1000)
+            # Don't add recvWindow for demo mode - some endpoints don't support it
+            # Sign BEFORE adding signature to params
+            p["signature"] = self._sign(p)
+
         headers = {"X-BX-APIKEY": self._api_key}
         url = self._base_url + endpoint
         async with self._session.get(url, params=p, headers=headers) as resp:
